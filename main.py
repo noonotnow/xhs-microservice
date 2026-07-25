@@ -48,9 +48,12 @@ def get_client() -> XhsClient:
     if client is None:
         cookie = load_cookie()
         client = XhsClient(cookie=cookie, sign=sign)
-        # rednote.com frontend uses edith.xiaohongshu.com (the default _host)
-        # so we do NOT override _host or _creator_host — library defaults are correct
-        # Only set home page and add Origin/Referer for international context
+        # For international RedNote accounts:
+        # - _host stays as edith.xiaohongshu.com (correct for API)
+        # - _creator_host changes to creator.rednote.com (international creator)
+        # - Creator endpoints use the library's built-in Python signing
+        #   which generates x-s-common (no Playwright needed for publishing!)
+        client._creator_host = "https://creator.rednote.com"
         client.home = "https://creator.rednote.com"
         client.session.headers.update({
             "Origin": "https://creator.rednote.com",
@@ -65,7 +68,7 @@ def refresh_client():
     global client
     cookie = load_cookie()
     client = XhsClient(cookie=cookie, sign=sign)
-    # Same as get_client — use default xiaohongshu.com hosts
+    client._creator_host = "https://creator.rednote.com"
     client.home = "https://creator.rednote.com"
     client.session.headers.update({
         "Origin": "https://creator.rednote.com",
