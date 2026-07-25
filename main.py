@@ -48,10 +48,14 @@ def get_client() -> XhsClient:
     if client is None:
         cookie = load_cookie()
         client = XhsClient(cookie=cookie, sign=sign)
-        # Use international API endpoints for rednote/overseas accounts
-        client._host = "https://edith.rnote.com"
-        client._creator_host = "https://creator.rnote.com"
+        # rednote.com frontend uses edith.xiaohongshu.com (the default _host)
+        # so we do NOT override _host or _creator_host — library defaults are correct
+        # Only set home page and add Origin/Referer for international context
         client.home = "https://www.rednote.com"
+        client.session.headers.update({
+            "Origin": "https://www.rednote.com",
+            "Referer": "https://www.rednote.com/",
+        })
         _patch_international_urls(client)
     return client
 
@@ -61,9 +65,12 @@ def refresh_client():
     global client
     cookie = load_cookie()
     client = XhsClient(cookie=cookie, sign=sign)
-    client._host = "https://edith.rnote.com"
-    client._creator_host = "https://creator.rnote.com"
+    # Same as get_client — use default xiaohongshu.com hosts
     client.home = "https://www.rednote.com"
+    client.session.headers.update({
+        "Origin": "https://www.rednote.com",
+        "Referer": "https://www.rednote.com/",
+    })
     _patch_international_urls(client)
 
 
@@ -128,7 +135,7 @@ def _patch_international_urls(xhs_client):
             "image_info": image_info,
             "video_info": video_info,
         }
-        headers = {"Referer": "https://creator.rnote.com/"}
+        headers = {"Referer": "https://creator.xiaohongshu.com/"}
         return self.post(uri, data, headers=headers)
 
     xhs_client.create_note = types.MethodType(patched_create_note, xhs_client)
