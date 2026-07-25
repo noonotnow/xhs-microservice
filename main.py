@@ -264,25 +264,26 @@ class PublishRequest(BaseModel):
 @app.post("/publish")
 def publish_note(req: PublishRequest, x_api_key: str | None = Header(None)):
     require_api_key(x_api_key)
-    xhs = get_client()
-
-    for f in req.files:
-        if not os.path.exists(f):
-            raise HTTPException(status_code=400, detail=f"File not found: {f}")
-
-    # Look up topics if keywords provided
-    topics = []
-    for keyword in req.topic_keywords:
-        try:
-            suggestions = xhs.get_suggest_topic(keyword)
-            if suggestions:
-                topics.append(suggestions[0])
-        except Exception:
-            pass
-
-    # Step-by-step publishing with detailed error reporting
-    steps = {}
     try:
+        xhs = get_client()
+
+        for f in req.files:
+            if not os.path.exists(f):
+                return {"status": "error", "detail": f"File not found: {f}"}
+
+        # Look up topics if keywords provided
+        topics = []
+        for keyword in req.topic_keywords:
+            try:
+                suggestions = xhs.get_suggest_topic(keyword)
+                if suggestions:
+                    topics.append(suggestions[0])
+            except Exception:
+                pass
+
+        # Step-by-step publishing with detailed error reporting
+        steps = {}
+
         # Step 1: Get upload permit
         image_id, token = xhs.get_upload_files_permit("image")
         steps["1_permit"] = {"ok": True, "file_id": image_id[:30]}
@@ -301,7 +302,7 @@ def publish_note(req: PublishRequest, x_api_key: str | None = Header(None)):
         result = xhs.create_note(
             title=req.title,
             desc=req.desc,
-            note_type=1,  # NoteType.NORMAL
+            note_type=1,
             topics=topics,
             image_info={"images": images},
             is_private=req.is_private,
@@ -311,9 +312,7 @@ def publish_note(req: PublishRequest, x_api_key: str | None = Header(None)):
         return {"status": "success", "data": result, "steps": steps}
     except Exception as e:
         import traceback
-        steps["error"] = str(e)
-        steps["traceback"] = traceback.format_exc()
-        raise HTTPException(status_code=500, detail=json.dumps(steps))
+        return {"status": "error", "detail": str(e), "traceback": traceback.format_exc()}
 
 
 # --- Health Check ---
