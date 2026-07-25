@@ -124,7 +124,10 @@ def _patch_international_urls(xhs_client):
             "suggest_topic_request": {"title": "", "desc": ""},
             "page": {"page_size": 20, "page": 1},
         }
-        return self.post(uri, data, is_creator=True)["topic_info_dtos"]
+        res = self.post(uri, data, is_creator=True)
+        if isinstance(res, dict):
+            return res.get("topic_info_dtos", [])
+        return []
 
     xhs_client.get_suggest_topic = types.MethodType(patched_get_suggest_topic, xhs_client)
 
