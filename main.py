@@ -299,8 +299,8 @@ def publish_note(req: PublishRequest, x_api_key: str | None = Header(None)):
         steps["1_permit"] = {"ok": True, "file_id": image_id[:30]}
 
         # Step 2: Upload file to CDN
-        xhs.upload_file(image_id, token, req.files[0])
-        steps["2_upload"] = {"ok": True}
+        upload_resp = xhs.upload_file(image_id, token, req.files[0])
+        steps["2_upload"] = {"ok": True, "status": getattr(upload_resp, 'status_code', 'unknown')}
 
         # Step 3: Create note
         images = [{
@@ -319,6 +319,11 @@ def publish_note(req: PublishRequest, x_api_key: str | None = Header(None)):
             post_time=req.post_time,
         )
         steps["3_create_note"] = {"ok": True}
+        # Ensure result is JSON-serializable
+        if hasattr(result, 'json'):
+            result = result.json()
+        elif not isinstance(result, (dict, list, str, int, float, bool, type(None))):
+            result = str(result)
         return {"status": "success", "data": result, "steps": steps}
     except Exception as e:
         import traceback
