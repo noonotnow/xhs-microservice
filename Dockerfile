@@ -1,7 +1,6 @@
 FROM python:3.12-slim
 
-# Install system dependencies for Playwright/Chromium
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     ca-certificates \
     fonts-liberation \
@@ -19,6 +18,7 @@ RUN apt-get update && apt-get install -y \
     libxcomposite1 \
     libxdamage1 \
     libxrandr2 \
+    libxshmfence1 \
     xdg-utils \
     libpango-1.0-0 \
     libcairo2 \
@@ -27,28 +27,22 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright browsers (Chromium only)
+# Install Chromium only (no install-deps needed, we handled it above)
 RUN playwright install chromium
-RUN playwright install-deps chromium
 
-# Download stealth.min.js (anti-detection)
-RUN wget -O /app/stealth.min.js https://raw.githubusercontent.com/nicegram/nicegram-stealthkit/master/nicegram-stealthkit.min.js || \
-    wget -O /app/stealth.min.js https://cdn.jsdelivr.net/gh/nicegram/nicegram-stealthkit@main/nicegram-stealthkit.min.js || \
+# Download stealth.min.js
+RUN wget -q -O /app/stealth.min.js \
+    https://raw.githubusercontent.com/nicegram/nicegram-stealthkit/master/nicegram-stealthkit.min.js || \
     echo "// stealth fallback" > /app/stealth.min.js
 
-# Copy application code
 COPY main.py .
 COPY sign_service.py .
 
-# Create data and upload directories
 RUN mkdir -p /app/data/uploads
 
-# Expose port
 EXPOSE 8000
 
-# Run with uvicorn
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
