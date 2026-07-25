@@ -12,9 +12,9 @@ from time import sleep
 from playwright.sync_api import sync_playwright
 
 STEALTH_JS_PATH = os.getenv("STEALTH_JS_PATH", "/app/stealth.min.js")
-# Use rednote.com for international accounts — the signing JS is loaded
-# from as.rednote.com and may differ from xiaohongshu.com's version
-SIGN_DOMAIN = os.getenv("XHS_SIGN_DOMAIN", "www.rednote.com")
+# Use creator.rednote.com for international accounts — the creator page
+# loads its signing JS with appId=ugc (vs xhs-pc-web on the main site)
+SIGN_DOMAIN = os.getenv("XHS_SIGN_DOMAIN", "creator.rednote.com")
 COOKIE_DOMAIN = os.getenv("XHS_COOKIE_DOMAIN", ".rednote.com")
 
 

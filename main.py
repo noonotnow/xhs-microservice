@@ -51,10 +51,10 @@ def get_client() -> XhsClient:
         # rednote.com frontend uses edith.xiaohongshu.com (the default _host)
         # so we do NOT override _host or _creator_host — library defaults are correct
         # Only set home page and add Origin/Referer for international context
-        client.home = "https://www.rednote.com"
+        client.home = "https://creator.rednote.com"
         client.session.headers.update({
-            "Origin": "https://www.rednote.com",
-            "Referer": "https://www.rednote.com/",
+            "Origin": "https://creator.rednote.com",
+            "Referer": "https://creator.rednote.com/",
         })
         _patch_international_urls(client)
     return client
@@ -66,10 +66,10 @@ def refresh_client():
     cookie = load_cookie()
     client = XhsClient(cookie=cookie, sign=sign)
     # Same as get_client — use default xiaohongshu.com hosts
-    client.home = "https://www.rednote.com"
+    client.home = "https://creator.rednote.com"
     client.session.headers.update({
-        "Origin": "https://www.rednote.com",
-        "Referer": "https://www.rednote.com/",
+        "Origin": "https://creator.rednote.com",
+        "Referer": "https://creator.rednote.com/",
     })
     _patch_international_urls(client)
 
