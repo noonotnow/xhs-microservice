@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.env
+.env.local
+data/
+uploads/
+*.json
+!railway.toml
+!requirements.txt
