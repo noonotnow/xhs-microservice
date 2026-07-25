@@ -1,5 +1,5 @@
 fastapi==0.115.0
 uvicorn==0.30.0
-xhs==0.3.9
+xhs==0.2.13
 playwright==1.47.0
 python-multipart==0.0.9
