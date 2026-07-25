@@ -381,12 +381,32 @@ def debug_publish_steps(x_api_key: str | None = Header(None)):
     xhs = get_client()
     results = {}
 
-    # Step 1: get_self_info
+    # Step 0: verify signing works (pure Python now, no Playwright)
+    try:
+        from sign_service import sign as test_sign
+        sig = test_sign("/api/sns/web/v1/feed", None, a1=xhs.cookie_dict.get("a1", ""))
+        results["0_signing"] = {
+            "ok": True,
+            "x-s_prefix": sig["x-s"][:20],
+            "has_x-s-common": "x-s-common" in sig and len(sig["x-s-common"]) > 0,
+            "x-s-common_len": len(sig.get("x-s-common", "")),
+        }
+    except Exception as e:
+        results["0_signing"] = {"ok": False, "error": str(e)}
+
+    # Step 1: get_self_info (regular endpoint, edith.xiaohongshu.com)
     try:
         info = xhs.get_self_info()
         results["1_self_info"] = {"ok": True, "data": str(info)[:200]}
     except Exception as e:
         results["1_self_info"] = {"ok": False, "error": str(e)}
+
+    # Step 1b: get_self_info_from_creator (creator endpoint, uses Python signing + x-s-common)
+    try:
+        info = xhs.get_self_info_from_creator()
+        results["1b_creator_self_info"] = {"ok": True, "data": str(info)[:200]}
+    except Exception as e:
+        results["1b_creator_self_info"] = {"ok": False, "error": str(e)}
 
     # Step 2: get_upload_files_permit
     try:
