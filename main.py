@@ -401,19 +401,32 @@ def debug_publish_steps(x_api_key: str | None = Header(None)):
     except Exception as e:
         results["1_self_info"] = {"ok": False, "error": str(e)}
 
-    # Step 1b: get_self_info_from_creator (creator endpoint, uses Python signing + x-s-common)
+    # Step 1b: creator self info (manual call with is_creator=True)
     try:
-        info = xhs.get_self_info_from_creator()
+        uri = "/api/galaxy/creator/home/personal_info"
+        info = xhs.get(uri, is_creator=True)
         results["1b_creator_self_info"] = {"ok": True, "data": str(info)[:200]}
     except Exception as e:
         results["1b_creator_self_info"] = {"ok": False, "error": str(e)}
 
-    # Step 2: get_upload_files_permit
+    # Step 2: get_upload_files_permit (manual with is_creator=True)
     try:
-        file_id, token = xhs.get_upload_files_permit("image")
-        results["2_upload_permit"] = {"ok": True, "file_id": file_id, "token": token[:20] + "..."}
+        uri = "/api/media/v1/upload/web/permit"
+        params = {"biz_name": "spectrum", "scene": "image", "file_count": 1, "version": "1", "source": "web"}
+        res = xhs.get(uri, params, is_creator=True)
+        temp_permit = res["uploadTempPermits"][0]
+        results["2_upload_permit"] = {"ok": True, "file_id": temp_permit["fileIds"][0]}
     except Exception as e:
         results["2_upload_permit"] = {"ok": False, "error": str(e)}
+
+    # Step 2b: creator upload permit (the exact URL from Katie's browser)
+    try:
+        uri = "/api/media/v1/upload/creator/permit"
+        params = {"biz_name": "spectrum", "scene": "image", "file_count": 1, "version": "1", "source": "web"}
+        res = xhs.get(uri, params, is_creator=True)
+        results["2b_creator_upload_permit"] = {"ok": True, "data": str(res)[:200]}
+    except Exception as e:
+        results["2b_creator_upload_permit"] = {"ok": False, "error": str(e)}
 
     # Step 3: get_suggest_topic
     try:
