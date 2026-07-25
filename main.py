@@ -274,6 +274,46 @@ def health():
     return {"status": "ok", "has_cookie": os.path.exists(COOKIE_FILE)}
 
 
+# --- Debug: test signing function ---
+@app.get("/debug/sign-test")
+def debug_sign_test(x_api_key: str | None = Header(None)):
+    """Test if _webmsxyw loads and signs correctly on creator.rednote.com."""
+    require_api_key(x_api_key)
+    import time
+    xhs = get_client()
+    cookie_str = xhs.cookie or ""
+    a1 = ""
+    web_session_val = ""
+    for part in cookie_str.split(";"):
+        part = part.strip()
+        if part.startswith("a1="):
+            a1 = part[3:]
+        elif part.startswith("web_session="):
+            web_session_val = part[12:]
+
+    test_uri = "/api/sns/web/v1/user/selfinfo"
+    start = time.time()
+    try:
+        result = sign(test_uri, None, a1, web_session_val)
+        elapsed = round(time.time() - start, 2)
+        return {
+            "success": True,
+            "elapsed_seconds": elapsed,
+            "x_s_preview": result.get("x-s", "")[:50] + "...",
+            "x_t": result.get("x-t", ""),
+            "a1_used": a1[:10] + "..." if a1 else "MISSING",
+            "web_session_used": web_session_val[:10] + "..." if web_session_val else "MISSING",
+        }
+    except Exception as e:
+        elapsed = round(time.time() - start, 2)
+        return {
+            "success": False,
+            "elapsed_seconds": elapsed,
+            "error": str(e),
+            "a1_used": a1[:10] + "..." if a1 else "MISSING",
+        }
+
+
 # --- Debug: test each publish step ---
 @app.get("/debug/publish-steps")
 def debug_publish_steps(x_api_key: str | None = Header(None)):
