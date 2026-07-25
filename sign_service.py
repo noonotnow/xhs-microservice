@@ -8,6 +8,9 @@ from time import sleep
 from playwright.sync_api import sync_playwright
 
 STEALTH_JS_PATH = os.getenv("STEALTH_JS_PATH", "/app/stealth.min.js")
+# Use international rednote domain for overseas accounts
+SIGN_DOMAIN = os.getenv("XHS_SIGN_DOMAIN", "www.rednote.com")
+COOKIE_DOMAIN = os.getenv("XHS_COOKIE_DOMAIN", ".rednote.com")
 
 
 def sign(uri, data=None, a1="", web_session=""):
@@ -37,14 +40,14 @@ def sign(uri, data=None, a1="", web_session=""):
                     browser_context.add_init_script(path=STEALTH_JS_PATH)
 
                 context_page = browser_context.new_page()
-                context_page.goto("https://www.xiaohongshu.com")
+                context_page.goto(f"https://{SIGN_DOMAIN}")
 
                 browser_context.add_cookies([
-                    {"name": "a1", "value": a1, "domain": ".xiaohongshu.com", "path": "/"}
+                    {"name": "a1", "value": a1, "domain": COOKIE_DOMAIN, "path": "/"}
                 ])
                 if web_session:
                     browser_context.add_cookies([
-                        {"name": "web_session", "value": web_session, "domain": ".xiaohongshu.com", "path": "/"}
+                        {"name": "web_session", "value": web_session, "domain": COOKIE_DOMAIN, "path": "/"}
                     ])
 
                 context_page.reload()
