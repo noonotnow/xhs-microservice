@@ -89,25 +89,46 @@ def get_login_client() -> XhsClient:
 
 
 def _patch_international_urls(xhs_client):
-    """Monkey-patch the xhs library to use international endpoints for publishing."""
+    """Monkey-patch the xhs library to route ALL calls through creator path.
+
+    For international RedNote accounts, only is_creator=True works
+    (uses Python signing + x-s-common + creator.rednote.com host).
+    """
     import types
 
-    # Patch upload_file to use rnote upload server (fallback to xiaohongshu if needed)
-    original_upload = xhs_client.upload_file
+    # Patch get_self_info to use creator endpoint
+    def patched_get_self_info(self):
+        uri = "/api/galaxy/creator/home/personal_info"
+        return self.get(uri, is_creator=True)
 
-    def patched_upload_file(self, file_id, token, file_path, content_type="image/jpeg"):
-        import os as _os
-        # Try rnote upload first, the CDN might be shared
-        url = "https://ros-upload.xiaohongshu.com/" + file_id
-        headers = {"X-Cos-Security-Token": token, "Content-Type": content_type}
-        with open(file_path, "rb") as f:
-            return self.request("PUT", url, data=f, headers=headers)
+    xhs_client.get_self_info = types.MethodType(patched_get_self_info, xhs_client)
 
-    xhs_client.upload_file = types.MethodType(patched_upload_file, xhs_client)
+    # Patch get_upload_files_permit to use creator path
+    def patched_get_upload_files_permit(self, file_type, count=1):
+        uri = "/api/media/v1/upload/web/permit"
+        params = {
+            "biz_name": "spectrum", "scene": file_type,
+            "file_count": count, "version": "1", "source": "web",
+        }
+        res = self.get(uri, params, is_creator=True)
+        temp_permit = res["uploadTempPermits"][0]
+        return temp_permit["fileIds"][0], temp_permit["token"]
 
-    # Patch create_note to use correct Referer
-    original_create_note = xhs_client.create_note
+    xhs_client.get_upload_files_permit = types.MethodType(patched_get_upload_files_permit, xhs_client)
 
+    # Patch get_suggest_topic to use creator path
+    def patched_get_suggest_topic(self, keyword=""):
+        uri = "/web_api/sns/v1/search/topic"
+        data = {
+            "keyword": keyword,
+            "suggest_topic_request": {"title": "", "desc": ""},
+            "page": {"page_size": 20, "page": 1},
+        }
+        return self.post(uri, data, is_creator=True)["topic_info_dtos"]
+
+    xhs_client.get_suggest_topic = types.MethodType(patched_get_suggest_topic, xhs_client)
+
+    # Patch create_note to use creator path + correct Referer
     def patched_create_note(self, title, desc, note_type, ats=None, topics=None,
                             image_info=None, video_info=None, post_time=None, is_private=False):
         from datetime import datetime as _dt
@@ -138,8 +159,7 @@ def _patch_international_urls(xhs_client):
             "image_info": image_info,
             "video_info": video_info,
         }
-        headers = {"Referer": "https://creator.xiaohongshu.com/"}
-        return self.post(uri, data, headers=headers)
+        return self.post(uri, data, is_creator=True)
 
     xhs_client.create_note = types.MethodType(patched_create_note, xhs_client)
 
