@@ -58,16 +58,27 @@ def sign(uri, data=None, a1="", web_session=""):
                 context_page.reload()
 
                 # Wait for _webmsxyw to be loaded by the security script
-                # rednote.com loads it async from as.rednote.com
                 context_page.wait_for_function(
                     "() => typeof window._webmsxyw === 'function'",
                     timeout=10000
                 )
 
-                encrypt_params = context_page.evaluate(
-                    "([url, data]) => window._webmsxyw(url, data)",
-                    [uri, data]
-                )
+                # The security system loads in stages:
+                # 1. Basic _webmsxyw appears (produces XYW_ signatures — rejected by API)
+                # 2. webprofile + scripting calls verify the browser
+                # 3. _webmsxyw gets upgraded (produces XYS_ signatures — accepted)
+                # Wait for the upgrade by polling the output prefix
+                for wait_attempt in range(20):
+                    test_result = context_page.evaluate(
+                        "([url, data]) => window._webmsxyw(url, data)",
+                        [uri, data]
+                    )
+                    xs_value = test_result.get("X-s", "")
+                    if xs_value.startswith("XYS_"):
+                        break
+                    sleep(0.5)
+
+                encrypt_params = test_result
 
                 browser.close()
 
