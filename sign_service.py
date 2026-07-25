@@ -8,9 +8,10 @@ from time import sleep
 from playwright.sync_api import sync_playwright
 
 STEALTH_JS_PATH = os.getenv("STEALTH_JS_PATH", "/app/stealth.min.js")
-# Use international rednote domain for overseas accounts
-SIGN_DOMAIN = os.getenv("XHS_SIGN_DOMAIN", "www.rednote.com")
-COOKIE_DOMAIN = os.getenv("XHS_COOKIE_DOMAIN", ".rednote.com")
+# Sign against xiaohongshu.com (signing JS lives there) even for international accounts
+# The API endpoints use rnote.com, but the signing function is domain-independent
+SIGN_DOMAIN = os.getenv("XHS_SIGN_DOMAIN", "www.xiaohongshu.com")
+COOKIE_DOMAIN = os.getenv("XHS_COOKIE_DOMAIN", ".xiaohongshu.com")
 
 
 def sign(uri, data=None, a1="", web_session=""):
