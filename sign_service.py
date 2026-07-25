@@ -31,14 +31,27 @@ def _get_page(a1="", web_session=""):
     if _page and not _page.is_closed():
         return _page
 
-    # Launch persistent browser
+    # Start Xvfb for headed mode (fools bot detection)
+    import subprocess
+    try:
+        subprocess.Popen(
+            ["Xvfb", ":99", "-screen", "0", "1920x1080x24", "-nolisten", "tcp"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        os.environ["DISPLAY"] = ":99"
+        sleep(1)
+    except Exception:
+        pass  # Fall back to headless if Xvfb unavailable
+
+    # Launch persistent browser in HEADED mode (non-headless avoids bot fingerprinting)
     _playwright = sync_playwright().start()
     _browser = _playwright.chromium.launch(
-        headless=True,
+        headless=False,
         args=[
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
             "--disable-dev-shm-usage",
+            "--disable-gpu",
         ]
     )
     _context = _browser.new_context(
