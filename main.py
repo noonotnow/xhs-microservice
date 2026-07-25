@@ -249,3 +249,34 @@ def publish_note(req: PublishRequest, x_api_key: str | None = Header(None)):
 @app.get("/health")
 def health():
     return {"status": "ok", "has_cookie": os.path.exists(COOKIE_FILE)}
+
+
+# --- Debug: test each publish step ---
+@app.get("/debug/publish-steps")
+def debug_publish_steps(x_api_key: str | None = Header(None)):
+    require_api_key(x_api_key)
+    xhs = get_client()
+    results = {}
+
+    # Step 1: get_self_info
+    try:
+        info = xhs.get_self_info()
+        results["1_self_info"] = {"ok": True, "data": str(info)[:200]}
+    except Exception as e:
+        results["1_self_info"] = {"ok": False, "error": str(e)}
+
+    # Step 2: get_upload_files_permit
+    try:
+        file_id, token = xhs.get_upload_files_permit("image")
+        results["2_upload_permit"] = {"ok": True, "file_id": file_id, "token": token[:20] + "..."}
+    except Exception as e:
+        results["2_upload_permit"] = {"ok": False, "error": str(e)}
+
+    # Step 3: get_suggest_topic
+    try:
+        topics = xhs.get_suggest_topic("test")
+        results["3_suggest_topic"] = {"ok": True, "count": len(topics) if topics else 0}
+    except Exception as e:
+        results["3_suggest_topic"] = {"ok": False, "error": str(e)}
+
+    return results
