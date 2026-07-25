@@ -314,6 +314,63 @@ def debug_sign_test(x_api_key: str | None = Header(None)):
         }
 
 
+# --- Debug: test direct creator API ---
+@app.get("/debug/creator-direct")
+def debug_creator_direct(x_api_key: str | None = Header(None)):
+    """Test direct request to creator.rednote.com API with our signing."""
+    require_api_key(x_api_key)
+    import requests
+    import time
+
+    cookie_str = load_cookie()
+    if not cookie_str:
+        return {"error": "No cookies saved"}
+
+    # Parse a1 and web_session
+    a1 = ""
+    web_session_val = ""
+    for part in cookie_str.split(";"):
+        part = part.strip()
+        if part.startswith("a1="):
+            a1 = part[3:]
+        elif part.startswith("web_session="):
+            web_session_val = part[12:]
+
+    # Sign the creator API path
+    uri = "/api/media/v1/upload/creator/permit?biz_name=spectrum&scene=video&file_count=1&version=1&source=web"
+    try:
+        sign_result = sign(uri, None, a1, web_session_val)
+    except Exception as e:
+        return {"error": f"Signing failed: {e}"}
+
+    # Make direct request to creator.rednote.com
+    url = f"https://creator.rednote.com{uri}"
+    headers = {
+        "Cookie": cookie_str,
+        "Origin": "https://creator.rednote.com",
+        "Referer": "https://creator.rednote.com/publish/publish",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "X-S": sign_result["x-s"],
+        "X-T": sign_result["x-t"],
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Ch-Ua-Platform": '"macOS"',
+    }
+
+    start = time.time()
+    resp = requests.get(url, headers=headers, timeout=30)
+    elapsed = round(time.time() - start, 2)
+
+    return {
+        "status_code": resp.status_code,
+        "elapsed_seconds": elapsed,
+        "response": resp.json() if resp.headers.get("content-type", "").startswith("application/json") else resp.text[:200],
+        "x_s_used": sign_result["x-s"][:30] + "...",
+    }
+
+
 # --- Debug: test each publish step ---
 @app.get("/debug/publish-steps")
 def debug_publish_steps(x_api_key: str | None = Header(None)):
