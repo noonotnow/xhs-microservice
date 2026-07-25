@@ -11,6 +11,3 @@ restartPolicyMaxRetries = 3
 
 [[mounts]]
 mountPath = "/app/data"
-
-[[mounts]]
-mountPath = "/app/uploads"
