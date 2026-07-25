@@ -320,8 +320,12 @@ def publish_note(req: PublishRequest, x_api_key: str | None = Header(None)):
         )
         steps["3_create_note"] = {"ok": True}
         # Ensure result is JSON-serializable
-        if hasattr(result, 'json'):
-            result = result.json()
+        if hasattr(result, 'status_code'):
+            # It's a requests.Response object
+            try:
+                result = result.json()
+            except Exception:
+                result = {"response_status": result.status_code, "response_text": result.text[:200] if result.text else "empty"}
         elif not isinstance(result, (dict, list, str, int, float, bool, type(None))):
             result = str(result)
         return {"status": "success", "data": result, "steps": steps}
