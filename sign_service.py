@@ -6,11 +6,16 @@ We replicate this by running a headless Chromium instance.
 For international (RedNote) accounts, we navigate to creator.rednote.com.
 We keep a persistent browser context to avoid triggering bot detection
 on every request (new browser = instant bot flag → XYW_ fallback signer).
+
+Uses playwright-stealth to patch browser fingerprints and pass the
+security system's webprofile check (needed for XYS_ signatures).
 """
 import os
+import subprocess
 import threading
 from time import sleep
 from playwright.sync_api import sync_playwright
+from playwright_stealth import stealth_sync
 
 STEALTH_JS_PATH = os.getenv("STEALTH_JS_PATH", "/app/stealth.min.js")
 SIGN_DOMAIN = os.getenv("XHS_SIGN_DOMAIN", "creator.rednote.com")
@@ -32,7 +37,6 @@ def _get_page(a1="", web_session=""):
         return _page
 
     # Start Xvfb for headed mode (fools bot detection)
-    import subprocess
     try:
         subprocess.Popen(
             ["Xvfb", ":99", "-screen", "0", "1920x1080x24", "-nolisten", "tcp"],
@@ -43,10 +47,12 @@ def _get_page(a1="", web_session=""):
     except Exception:
         pass  # Fall back to headless if Xvfb unavailable
 
-    # Launch persistent browser in HEADED mode (non-headless avoids bot fingerprinting)
+    use_headless = os.environ.get("DISPLAY") is None
+
+    # Launch persistent browser
     _playwright = sync_playwright().start()
     _browser = _playwright.chromium.launch(
-        headless=False,
+        headless=use_headless,
         args=[
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
@@ -60,9 +66,6 @@ def _get_page(a1="", web_session=""):
         locale="en-US",
     )
 
-    if os.path.exists(STEALTH_JS_PATH):
-        _context.add_init_script(path=STEALTH_JS_PATH)
-
     # Set cookies BEFORE navigating so the page loads authenticated
     if a1:
         _context.add_cookies([
@@ -74,6 +77,9 @@ def _get_page(a1="", web_session=""):
         ])
 
     _page = _context.new_page()
+    # Apply stealth patches (navigator.webdriver, chrome.runtime, WebGL, etc.)
+    stealth_sync(_page)
+
     _page.goto(f"https://{SIGN_DOMAIN}", wait_until="load", timeout=30000)
 
     # Wait for security system to fully initialize
