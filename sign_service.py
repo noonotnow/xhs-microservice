@@ -6,16 +6,18 @@ We replicate this by running a headless Chromium instance.
 For international (RedNote) accounts, we navigate to creator.rednote.com.
 We keep a persistent browser context to avoid triggering bot detection
 on every request (new browser = instant bot flag → XYW_ fallback signer).
-
-Uses playwright-stealth to patch browser fingerprints and pass the
-security system's webprofile check (needed for XYS_ signatures).
 """
 import os
 import subprocess
 import threading
 from time import sleep
 from playwright.sync_api import sync_playwright
-from playwright_stealth import stealth_sync
+
+try:
+    from playwright_stealth import stealth_sync
+    HAS_STEALTH = True
+except ImportError:
+    HAS_STEALTH = False
 
 STEALTH_JS_PATH = os.getenv("STEALTH_JS_PATH", "/app/stealth.min.js")
 SIGN_DOMAIN = os.getenv("XHS_SIGN_DOMAIN", "creator.rednote.com")
@@ -27,6 +29,27 @@ _context = None
 _page = None
 _lock = threading.Lock()
 _playwright = None
+_xvfb_started = False
+
+
+def _start_xvfb():
+    """Try to start Xvfb for headed mode. Returns True if successful."""
+    global _xvfb_started
+    if _xvfb_started:
+        return True
+    try:
+        proc = subprocess.Popen(
+            ["Xvfb", ":99", "-screen", "0", "1920x1080x24", "-nolisten", "tcp"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        sleep(1)
+        if proc.poll() is None:  # Still running
+            os.environ["DISPLAY"] = ":99"
+            _xvfb_started = True
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _get_page(a1="", web_session=""):
@@ -36,23 +59,12 @@ def _get_page(a1="", web_session=""):
     if _page and not _page.is_closed():
         return _page
 
-    # Start Xvfb for headed mode (fools bot detection)
-    try:
-        subprocess.Popen(
-            ["Xvfb", ":99", "-screen", "0", "1920x1080x24", "-nolisten", "tcp"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-        os.environ["DISPLAY"] = ":99"
-        sleep(1)
-    except Exception:
-        pass  # Fall back to headless if Xvfb unavailable
+    # Try headed mode with Xvfb, fall back to headless
+    use_headed = _start_xvfb()
 
-    use_headless = os.environ.get("DISPLAY") is None
-
-    # Launch persistent browser
     _playwright = sync_playwright().start()
     _browser = _playwright.chromium.launch(
-        headless=use_headless,
+        headless=not use_headed,
         args=[
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
@@ -77,8 +89,12 @@ def _get_page(a1="", web_session=""):
         ])
 
     _page = _context.new_page()
+
     # Apply stealth patches (navigator.webdriver, chrome.runtime, WebGL, etc.)
-    stealth_sync(_page)
+    if HAS_STEALTH:
+        stealth_sync(_page)
+    elif os.path.exists(STEALTH_JS_PATH):
+        _context.add_init_script(path=STEALTH_JS_PATH)
 
     _page.goto(f"https://{SIGN_DOMAIN}", wait_until="load", timeout=30000)
 
