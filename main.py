@@ -14,7 +14,7 @@ app = FastAPI(title="XHS Microservice", version="1.0.0")
 # --- Config ---
 API_KEY = os.getenv("XHS_API_KEY", "change-me-in-production")
 DATA_DIR = os.getenv("DATA_DIR", "/app/data")
-UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/app/uploads")
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/app/data/uploads")
 COOKIE_FILE = os.path.join(DATA_DIR, "cookie.json")
 QR_STATE_FILE = os.path.join(DATA_DIR, "qr_state.json")
 

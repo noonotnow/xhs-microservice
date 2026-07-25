@@ -48,7 +48,7 @@ XHS handles the actual publishing at the scheduled time.
 
 1. Push to GitHub
 2. Connect repo in Railway
-3. Add volume mounts for `/app/data` and `/app/uploads`
+3. Add a volume mount at `/app/data` (stores cookies, state, and uploads)
 4. Set env var: `XHS_API_KEY=<your-secret>`
 5. Deploy
 

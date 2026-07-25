@@ -45,7 +45,7 @@ COPY main.py .
 COPY sign_service.py .
 
 # Create data and upload directories
-RUN mkdir -p /app/data /app/uploads
+RUN mkdir -p /app/data/uploads
 
 # Expose port
 EXPOSE 8000
