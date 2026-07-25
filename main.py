@@ -51,6 +51,7 @@ def get_client() -> XhsClient:
         client._host = "https://edith.rnote.com"
         client._creator_host = "https://creator.rnote.com"
         client.home = "https://www.rednote.com"
+        _patch_international_urls(client)
     return client
 
 
@@ -62,6 +63,63 @@ def refresh_client():
     client._host = "https://edith.rnote.com"
     client._creator_host = "https://creator.rnote.com"
     client.home = "https://www.rednote.com"
+    _patch_international_urls(client)
+
+
+def _patch_international_urls(xhs_client):
+    """Monkey-patch the xhs library to use international endpoints for publishing."""
+    import types
+
+    # Patch upload_file to use rnote upload server (fallback to xiaohongshu if needed)
+    original_upload = xhs_client.upload_file
+
+    def patched_upload_file(self, file_id, token, file_path, content_type="image/jpeg"):
+        import os as _os
+        # Try rnote upload first, the CDN might be shared
+        url = "https://ros-upload.xiaohongshu.com/" + file_id
+        headers = {"X-Cos-Security-Token": token, "Content-Type": content_type}
+        with open(file_path, "rb") as f:
+            return self.request("PUT", url, data=f, headers=headers)
+
+    xhs_client.upload_file = types.MethodType(patched_upload_file, xhs_client)
+
+    # Patch create_note to use correct Referer
+    original_create_note = xhs_client.create_note
+
+    def patched_create_note(self, title, desc, note_type, ats=None, topics=None,
+                            image_info=None, video_info=None, post_time=None, is_private=False):
+        from datetime import datetime as _dt
+        import json as _json
+
+        if ats is None:
+            ats = []
+        if topics is None:
+            topics = []
+        if post_time:
+            post_date_time = _dt.strptime(post_time, "%Y-%m-%d %H:%M:%S")
+            post_time = round(int(post_date_time.timestamp()) * 1000)
+
+        uri = "/web_api/sns/v2/note"
+        business_binds = {
+            "version": 1, "noteId": 0, "noteOrderBind": {},
+            "notePostTiming": {"postTime": post_time},
+            "noteCollectionBind": {"id": ""}
+        }
+        data = {
+            "common": {
+                "type": note_type, "title": title, "note_id": "", "desc": desc,
+                "source": '{"type":"web","ids":"","extraInfo":"{\\"subType\\":\\"official\\"}"}',
+                "business_binds": _json.dumps(business_binds, separators=(",", ":")),
+                "ats": ats, "hash_tag": topics, "post_loc": {},
+                "privacy_info": {"op_type": 1, "type": int(is_private)},
+            },
+            "image_info": image_info,
+            "video_info": video_info,
+        }
+        headers = {"Referer": "https://creator.rnote.com/"}
+        return self.post(uri, data, headers=headers)
+
+    xhs_client.create_note = types.MethodType(patched_create_note, xhs_client)
 
 
 # --- QR Login ---
