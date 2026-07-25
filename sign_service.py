@@ -2,16 +2,20 @@
 
 The XHS web client uses a JS function `window._webmsxyw` to sign requests.
 We replicate this by running a headless Chromium instance.
+
+For international (RedNote) accounts, we navigate to www.rednote.com
+since the signing script is loaded from as.rednote.com and may generate
+different signatures than the Chinese xiaohongshu.com version.
 """
 import os
 from time import sleep
 from playwright.sync_api import sync_playwright
 
 STEALTH_JS_PATH = os.getenv("STEALTH_JS_PATH", "/app/stealth.min.js")
-# Sign against xiaohongshu.com (signing JS lives there) even for international accounts
-# The API endpoints use rnote.com, but the signing function is domain-independent
-SIGN_DOMAIN = os.getenv("XHS_SIGN_DOMAIN", "www.xiaohongshu.com")
-COOKIE_DOMAIN = os.getenv("XHS_COOKIE_DOMAIN", ".xiaohongshu.com")
+# Use rednote.com for international accounts — the signing JS is loaded
+# from as.rednote.com and may differ from xiaohongshu.com's version
+SIGN_DOMAIN = os.getenv("XHS_SIGN_DOMAIN", "www.rednote.com")
+COOKIE_DOMAIN = os.getenv("XHS_COOKIE_DOMAIN", ".rednote.com")
 
 
 def sign(uri, data=None, a1="", web_session=""):
@@ -30,7 +34,7 @@ def sign(uri, data=None, a1="", web_session=""):
     Returns:
         dict with "x-s" and "x-t" keys
     """
-    for _ in range(10):
+    for attempt in range(10):
         try:
             with sync_playwright() as playwright:
                 chromium = playwright.chromium
@@ -41,7 +45,7 @@ def sign(uri, data=None, a1="", web_session=""):
                     browser_context.add_init_script(path=STEALTH_JS_PATH)
 
                 context_page = browser_context.new_page()
-                context_page.goto(f"https://{SIGN_DOMAIN}")
+                context_page.goto(f"https://{SIGN_DOMAIN}", wait_until="domcontentloaded")
 
                 browser_context.add_cookies([
                     {"name": "a1", "value": a1, "domain": COOKIE_DOMAIN, "path": "/"}
@@ -52,7 +56,13 @@ def sign(uri, data=None, a1="", web_session=""):
                     ])
 
                 context_page.reload()
-                sleep(1)
+
+                # Wait for _webmsxyw to be loaded by the security script
+                # rednote.com loads it async from as.rednote.com
+                context_page.wait_for_function(
+                    "() => typeof window._webmsxyw === 'function'",
+                    timeout=10000
+                )
 
                 encrypt_params = context_page.evaluate(
                     "([url, data]) => window._webmsxyw(url, data)",
@@ -65,7 +75,8 @@ def sign(uri, data=None, a1="", web_session=""):
                     "x-s": encrypt_params["X-s"],
                     "x-t": str(encrypt_params["X-t"])
                 }
-        except Exception:
-            pass
+        except Exception as e:
+            if attempt == 9:
+                raise Exception(f"Failed to sign request after 10 attempts. Last error: {e}")
 
     raise Exception("Failed to sign request after 10 attempts")
