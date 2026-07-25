@@ -20,8 +20,8 @@ except ImportError:
     HAS_STEALTH = False
 
 STEALTH_JS_PATH = os.getenv("STEALTH_JS_PATH", "/app/stealth.min.js")
-SIGN_DOMAIN = os.getenv("XHS_SIGN_DOMAIN", "creator.rednote.com")
-COOKIE_DOMAIN = os.getenv("XHS_COOKIE_DOMAIN", ".rednote.com")
+SIGN_DOMAIN = os.getenv("XHS_SIGN_DOMAIN", "www.xiaohongshu.com")
+COOKIE_DOMAIN = os.getenv("XHS_COOKIE_DOMAIN", ".xiaohongshu.com")
 
 # Persistent browser state
 _browser = None
