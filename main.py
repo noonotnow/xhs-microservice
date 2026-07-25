@@ -172,7 +172,13 @@ def _patch_international_urls(xhs_client):
             "image_info": image_info,
             "video_info": video_info,
         }
-        return self.post(uri, data, is_creator=True)
+        # create_note goes to edith.xiaohongshu.com (not creator.rednote.com)
+        # The /web_api/sns/v2/note endpoint only exists on the main API host
+        headers = {
+            "Origin": "https://creator.rednote.com",
+            "Referer": "https://creator.rednote.com/",
+        }
+        return self.post(uri, data, headers=headers)
 
     xhs_client.create_note = types.MethodType(patched_create_note, xhs_client)
 
