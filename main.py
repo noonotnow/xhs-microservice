@@ -47,6 +47,10 @@ def get_client() -> XhsClient:
     if client is None:
         cookie = load_cookie()
         client = XhsClient(cookie=cookie, sign=sign)
+        # Use international API endpoints for rednote/overseas accounts
+        client._host = "https://edith.rnote.com"
+        client._creator_host = "https://creator.rnote.com"
+        client.home = "https://www.rednote.com"
     return client
 
 
@@ -55,6 +59,9 @@ def refresh_client():
     global client
     cookie = load_cookie()
     client = XhsClient(cookie=cookie, sign=sign)
+    client._host = "https://edith.rnote.com"
+    client._creator_host = "https://creator.rnote.com"
+    client.home = "https://www.rednote.com"
 
 
 # --- QR Login ---
