@@ -94,6 +94,21 @@ def check_login_status(x_api_key: str | None = Header(None)):
     }
 
 
+# --- Manual Cookie Login ---
+class CookieLoginRequest(BaseModel):
+    cookie: str
+
+
+@app.post("/login/cookie")
+def login_with_cookie(req: CookieLoginRequest, x_api_key: str | None = Header(None)):
+    require_api_key(x_api_key)
+    if not req.cookie.strip():
+        raise HTTPException(status_code=400, detail="Cookie string is empty")
+    save_cookie(req.cookie.strip())
+    refresh_client()
+    return {"status": "ok", "message": "Cookie saved. Use /session/status to verify."}
+
+
 # --- Session Health ---
 @app.get("/session/status")
 def session_status(x_api_key: str | None = Header(None)):
