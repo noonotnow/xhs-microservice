@@ -1,15 +1,25 @@
-from fastapi import FastAPI, HTTPException, Header, UploadFile, File
+from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import os
 import json
 import uuid
 import shutil
+import traceback
 from pathlib import Path
 
 from xhs import XhsClient
 from sign_service import sign
 
 app = FastAPI(title="XHS Microservice", version="1.0.0")
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={"error": str(exc), "traceback": traceback.format_exc()},
+    )
 
 # --- Config ---
 API_KEY = os.getenv("XHS_API_KEY", "change-me-in-production")
