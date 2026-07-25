@@ -280,18 +280,40 @@ def publish_note(req: PublishRequest, x_api_key: str | None = Header(None)):
         except Exception:
             pass
 
+    # Step-by-step publishing with detailed error reporting
+    steps = {}
     try:
-        result = xhs.create_image_note(
+        # Step 1: Get upload permit
+        image_id, token = xhs.get_upload_files_permit("image")
+        steps["1_permit"] = {"ok": True, "file_id": image_id[:30]}
+
+        # Step 2: Upload file to CDN
+        xhs.upload_file(image_id, token, req.files[0])
+        steps["2_upload"] = {"ok": True}
+
+        # Step 3: Create note
+        images = [{
+            "file_id": image_id,
+            "metadata": {"source": -1},
+            "stickers": {"version": 2, "floating": []},
+            "extra_info_json": '{"mimeType":"image/jpeg"}',
+        }]
+        result = xhs.create_note(
             title=req.title,
             desc=req.desc,
-            files=req.files,
-            post_time=req.post_time,
+            note_type=1,  # NoteType.NORMAL
             topics=topics,
+            image_info={"images": images},
             is_private=req.is_private,
+            post_time=req.post_time,
         )
-        return {"status": "success", "data": result}
+        steps["3_create_note"] = {"ok": True}
+        return {"status": "success", "data": result, "steps": steps}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        import traceback
+        steps["error"] = str(e)
+        steps["traceback"] = traceback.format_exc()
+        raise HTTPException(status_code=500, detail=json.dumps(steps))
 
 
 # --- Health Check ---
