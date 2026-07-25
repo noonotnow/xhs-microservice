@@ -151,8 +151,23 @@ def check_login_status(x_api_key: str | None = Header(None)):
     # code_status: 0=waiting, 1=scanned, 2=confirmed
     if status.get("code_status") == 2:
         save_cookie(xhs.cookie)
+        # Parse cookie keys and previews for debug
+        cookie_keys = []
+        cookie_preview = {}
+        for part in xhs.cookie.split(";"):
+            part = part.strip()
+            if "=" in part:
+                key, val = part.split("=", 1)
+                cookie_keys.append(key.strip())
+                cookie_preview[key.strip()] = val[:10] + "..."
         refresh_client()
         os.remove(QR_STATE_FILE)
+        return {
+            "code_status": status.get("code_status"),
+            "login_info": status.get("login_info"),
+            "cookie_keys": cookie_keys,
+            "cookie_preview": cookie_preview,
+        }
     return {
         "code_status": status.get("code_status"),
         "login_info": status.get("login_info"),
@@ -280,3 +295,57 @@ def debug_publish_steps(x_api_key: str | None = Header(None)):
         results["3_suggest_topic"] = {"ok": False, "error": str(e)}
 
     return results
+
+
+# --- Debug: cookie state ---
+@app.get("/debug/cookie-state")
+def debug_cookie_state(x_api_key: str | None = Header(None)):
+    require_api_key(x_api_key)
+    result = {
+        "client_initialized": client is not None,
+        "cookie_file": {},
+        "client_session_cookies": [],
+        "raw_cookie_parts": [],
+    }
+
+    # 1. Cookie file keys + value lengths
+    saved_cookie = load_cookie()
+    if saved_cookie:
+        file_keys = {}
+        for part in saved_cookie.split(";"):
+            part = part.strip()
+            if "=" in part:
+                key, val = part.split("=", 1)
+                file_keys[key.strip()] = len(val)
+        result["cookie_file"] = file_keys
+
+    # 2 & 3. Client session cookies and raw cookie string
+    if client is not None:
+        xhs = client
+
+        # Session cookie jar details
+        try:
+            for cookie in xhs.session.cookies:
+                result["client_session_cookies"].append({
+                    "name": cookie.name,
+                    "domain": cookie.domain,
+                    "value_length": len(cookie.value),
+                    "value_preview": cookie.value[:10] + "...",
+                })
+        except Exception as e:
+            result["client_session_cookies_error"] = str(e)
+
+        # Raw cookie string preview (first 20 chars of each part)
+        try:
+            raw = xhs.cookie
+            if raw:
+                for part in raw.split(";"):
+                    part = part.strip()
+                    if part:
+                        result["raw_cookie_parts"].append(
+                            part[:20] + "..." if len(part) > 20 else part
+                        )
+        except Exception as e:
+            result["raw_cookie_error"] = str(e)
+
+    return result
