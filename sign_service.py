@@ -24,7 +24,7 @@ _lock = threading.Lock()
 _playwright = None
 
 
-def _get_page():
+def _get_page(a1="", web_session=""):
     """Get or create a persistent browser page."""
     global _browser, _context, _page, _playwright
 
@@ -50,16 +50,26 @@ def _get_page():
     if os.path.exists(STEALTH_JS_PATH):
         _context.add_init_script(path=STEALTH_JS_PATH)
 
+    # Set cookies BEFORE navigating so the page loads authenticated
+    if a1:
+        _context.add_cookies([
+            {"name": "a1", "value": a1, "domain": COOKIE_DOMAIN, "path": "/"}
+        ])
+    if web_session:
+        _context.add_cookies([
+            {"name": "web_session", "value": web_session, "domain": COOKIE_DOMAIN, "path": "/"}
+        ])
+
     _page = _context.new_page()
-    _page.goto(f"https://{SIGN_DOMAIN}", wait_until="networkidle", timeout=30000)
+    _page.goto(f"https://{SIGN_DOMAIN}", wait_until="load", timeout=30000)
 
     # Wait for security system to fully initialize
     _page.wait_for_function(
         "() => typeof window._webmsxyw === 'function'",
         timeout=15000
     )
-    # Extra time for zeus-engine to complete webprofile verification
-    sleep(8)
+    # Extra time for the security system to upgrade from XYW_ to XYS_
+    sleep(5)
 
     return _page
 
@@ -82,9 +92,9 @@ def sign(uri, data=None, a1="", web_session=""):
     with _lock:
         for attempt in range(3):
             try:
-                page = _get_page()
+                page = _get_page(a1, web_session)
 
-                # Update cookies if needed
+                # Update cookies on existing context (for subsequent calls)
                 _context.add_cookies([
                     {"name": "a1", "value": a1, "domain": COOKIE_DOMAIN, "path": "/"}
                 ])
