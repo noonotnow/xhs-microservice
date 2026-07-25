@@ -20,6 +20,7 @@ QR_STATE_FILE = os.path.join(DATA_DIR, "qr_state.json")
 
 # --- Persistent client (singleton) ---
 client: XhsClient | None = None
+login_client: XhsClient | None = None
 
 
 def require_api_key(x_api_key: str | None):
@@ -64,6 +65,17 @@ def refresh_client():
     client._creator_host = "https://creator.rnote.com"
     client.home = "https://www.rednote.com"
     _patch_international_urls(client)
+
+
+def get_login_client() -> XhsClient:
+    """Create a client using xiaohongshu.com for QR login.
+    QR login must go through xiaohongshu.com — the resulting cookies
+    work cross-domain against rnote.com APIs."""
+    cookie = load_cookie()
+    login_client = XhsClient(cookie=cookie, sign=sign)
+    # Keep default xiaohongshu.com host for login
+    # Do NOT set rnote.com hosts
+    return login_client
 
 
 def _patch_international_urls(xhs_client):
@@ -125,10 +137,10 @@ def _patch_international_urls(xhs_client):
 # --- QR Login ---
 @app.get("/login/qr")
 def get_qr(x_api_key: str | None = Header(None)):
+    global login_client
     require_api_key(x_api_key)
-    xhs = get_client()
-    qr = xhs.get_qrcode()
-    # Save qr_id + code for check_qrcode later
+    login_client = get_login_client()
+    qr = login_client.get_qrcode()
     os.makedirs(DATA_DIR, exist_ok=True)
     with open(QR_STATE_FILE, "w") as f:
         json.dump({"qr_id": qr["qr_id"], "code": qr["code"]}, f)
@@ -141,33 +153,22 @@ def get_qr(x_api_key: str | None = Header(None)):
 
 @app.get("/login/status")
 def check_login_status(x_api_key: str | None = Header(None)):
+    global login_client
     require_api_key(x_api_key)
     if not os.path.exists(QR_STATE_FILE):
         raise HTTPException(status_code=400, detail="No QR login in progress. Call /login/qr first.")
     with open(QR_STATE_FILE, "r") as f:
         qr_state = json.load(f)
-    xhs = get_client()
-    status = xhs.check_qrcode(qr_state["qr_id"], qr_state["code"])
-    # code_status: 0=waiting, 1=scanned, 2=confirmed
+    if login_client is None:
+        login_client = get_login_client()
+    status = login_client.check_qrcode(qr_state["qr_id"], qr_state["code"])
     if status.get("code_status") == 2:
-        save_cookie(xhs.cookie)
-        # Parse cookie keys and previews for debug
-        cookie_keys = []
-        cookie_preview = {}
-        for part in xhs.cookie.split(";"):
-            part = part.strip()
-            if "=" in part:
-                key, val = part.split("=", 1)
-                cookie_keys.append(key.strip())
-                cookie_preview[key.strip()] = val[:10] + "..."
+        # Save cookies from xiaohongshu.com login
+        save_cookie(login_client.cookie)
+        # Rebuild the main client with rnote.com hosts + fresh cookies
         refresh_client()
+        login_client = None  # Clean up
         os.remove(QR_STATE_FILE)
-        return {
-            "code_status": status.get("code_status"),
-            "login_info": status.get("login_info"),
-            "cookie_keys": cookie_keys,
-            "cookie_preview": cookie_preview,
-        }
     return {
         "code_status": status.get("code_status"),
         "login_info": status.get("login_info"),
@@ -301,51 +302,57 @@ def debug_publish_steps(x_api_key: str | None = Header(None)):
 @app.get("/debug/cookie-state")
 def debug_cookie_state(x_api_key: str | None = Header(None)):
     require_api_key(x_api_key)
+    xhs = get_client()
     result = {
-        "client_initialized": client is not None,
-        "cookie_file": {},
-        "client_session_cookies": [],
-        "raw_cookie_parts": [],
+        "cookie_file_exists": os.path.exists(COOKIE_FILE),
+        "client_cookie_string": None,
+        "cookie_jar_entries": [],
+        "saved_cookie_keys": [],
     }
 
-    # 1. Cookie file keys + value lengths
-    saved_cookie = load_cookie()
-    if saved_cookie:
-        file_keys = {}
-        for part in saved_cookie.split(";"):
+    # Show current client cookie string (keys + value lengths only)
+    cookie_str = xhs.cookie
+    if cookie_str:
+        parts = cookie_str.split(";")
+        result["client_cookie_string"] = []
+        for part in parts:
             part = part.strip()
             if "=" in part:
                 key, val = part.split("=", 1)
-                file_keys[key.strip()] = len(val)
-        result["cookie_file"] = file_keys
-
-    # 2 & 3. Client session cookies and raw cookie string
-    if client is not None:
-        xhs = client
-
-        # Session cookie jar details
-        try:
-            for cookie in xhs.session.cookies:
-                result["client_session_cookies"].append({
-                    "name": cookie.name,
-                    "domain": cookie.domain,
-                    "value_length": len(cookie.value),
-                    "value_preview": cookie.value[:10] + "...",
+                result["client_cookie_string"].append({
+                    "key": key.strip(),
+                    "value_length": len(val.strip()),
+                    "value_preview": val.strip()[:10] + "..."
                 })
-        except Exception as e:
-            result["client_session_cookies_error"] = str(e)
 
-        # Raw cookie string preview (first 20 chars of each part)
+    # Show cookie jar entries with domain info
+    try:
+        for cookie in xhs.session.cookies:
+            result["cookie_jar_entries"].append({
+                "name": cookie.name,
+                "domain": cookie.domain,
+                "value_length": len(cookie.value),
+                "value_preview": cookie.value[:10] + "..."
+            })
+    except Exception as e:
+        result["cookie_jar_error"] = str(e)
+
+    # Show saved cookie file keys
+    if os.path.exists(COOKIE_FILE):
         try:
-            raw = xhs.cookie
-            if raw:
-                for part in raw.split(";"):
-                    part = part.strip()
-                    if part:
-                        result["raw_cookie_parts"].append(
-                            part[:20] + "..." if len(part) > 20 else part
-                        )
+            with open(COOKIE_FILE, "r") as f:
+                data = json.load(f)
+                saved = data.get("cookie", "")
+                if saved:
+                    for part in saved.split(";"):
+                        part = part.strip()
+                        if "=" in part:
+                            key, val = part.split("=", 1)
+                            result["saved_cookie_keys"].append({
+                                "key": key.strip(),
+                                "value_length": len(val.strip())
+                            })
         except Exception as e:
-            result["raw_cookie_error"] = str(e)
+            result["saved_cookie_error"] = str(e)
 
     return result
