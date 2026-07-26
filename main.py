@@ -593,10 +593,10 @@ def debug_cookie_state(x_api_key: str | None = Header(None)):
 # --- Debug: test note creation endpoint ---
 @app.get("/debug/test-create-note")
 def debug_test_create_note(x_api_key: str | None = Header(None)):
-    """Test create_note with a dummy payload to verify the endpoint works.
-    Uses is_private=True so nothing gets published publicly."""
+    """Test create_note approaches to find what works for international accounts."""
     require_api_key(x_api_key)
     import json as _json
+    import requests as _requests
 
     xhs = get_client()
     results = {}
@@ -611,63 +611,92 @@ def debug_test_create_note(x_api_key: str | None = Header(None)):
         results["0_auth"] = {"ok": False, "error": str(e)}
         return results
 
+    # Call sbtsource first (the browser does this to "register" the session)
+    try:
+        sbt_resp = _requests.post(
+            "https://as.rednote.com/api/sec/v1/sbtsource",
+            json={"callFrom": "creator-platform", "appId": "ugc"},
+            headers={
+                "Origin": "https://creator.rednote.com",
+                "Referer": "https://creator.rednote.com/",
+                "Content-Type": "application/json",
+                "Cookie": xhs.cookie,
+            },
+            timeout=10,
+        )
+        results["0b_sbtsource"] = {"status": sbt_resp.status_code, "response": sbt_resp.json() if sbt_resp.status_code == 200 else sbt_resp.text[:200]}
+    except Exception as e:
+        results["0b_sbtsource"] = {"error": str(e)}
+
     uri = "/web_api/sns/v2/note"
+    # Include capa_trace_info like the browser does
+    common_data = {
+        "type": 1, "title": "API test (will delete)", "note_id": "",
+        "desc": "Testing API connectivity - private post",
+        "source": '{"type":"web","ids":"","extraInfo":"{\\"subType\\":\\"official\\"}"}',
+        "business_binds": _json.dumps({
+            "version": 1, "noteId": 0, "noteOrderBind": {},
+            "notePostTiming": {"postTime": ""},
+            "noteCollectionBind": {"id": ""}
+        }, separators=(",", ":")),
+        "ats": [], "hash_tag": [], "post_loc": {},
+        "privacy_info": {"op_type": 1, "type": 1},  # PRIVATE
+        "capa_trace_info": {"contextJson": "{}"},
+    }
     data = {
-        "common": {
-            "type": 1, "title": "API test (will delete)", "note_id": "",
-            "desc": "Testing API connectivity - private post",
-            "source": '{"type":"web","ids":"","extraInfo":"{\\"subType\\":\\"official\\"}"}',
-            "business_binds": _json.dumps({
-                "version": 1, "noteId": 0, "noteOrderBind": {},
-                "notePostTiming": {"postTime": ""},
-                "noteCollectionBind": {"id": ""}
-            }, separators=(",", ":")),
-            "ats": [], "hash_tag": [], "post_loc": {},
-            "privacy_info": {"op_type": 1, "type": 1},  # PRIVATE
-        },
+        "common": common_data,
         "image_info": {"images": []},
         "video_info": None,
     }
     headers = {"Referer": "https://creator.rednote.com/publish/publish"}
 
-    # Approach 1: webapi.rednote.com (default host, no is_creator)
+    # Approach 1: webapi.rednote.com with capa_trace_info
     try:
         res = xhs.post(uri, data, headers=headers)
         if hasattr(res, 'status_code'):
             try:
-                results["1_webapi_path"] = {"response": res.json()}
+                results["1_webapi_with_trace"] = {"response": res.json()}
             except Exception:
-                results["1_webapi_path"] = {"status": res.status_code, "text": res.text[:300]}
+                results["1_webapi_with_trace"] = {"status": res.status_code, "text": res.text[:300]}
         else:
-            results["1_webapi_path"] = {"response": res}
+            results["1_webapi_with_trace"] = {"response": res}
     except Exception as e:
-        results["1_webapi_path"] = {"error": str(e)}
+        results["1_webapi_with_trace"] = {"error": str(e)}
 
-    # Approach 2: Try /fe_api/burdock/v2/note/post (alternative endpoint from commonPatch)
+    # Approach 2: www.rednote.com + /fe_api/burdock/v2/note/post
     try:
         burdock_uri = "/fe_api/burdock/v2/note/post"
+        # Temporarily swap host to www.rednote.com
+        old_host = xhs._host
+        xhs._host = "https://www.rednote.com"
         res2 = xhs.post(burdock_uri, data, headers=headers)
+        xhs._host = old_host
         if hasattr(res2, 'status_code'):
             try:
-                results["2_burdock_path"] = {"response": res2.json()}
+                results["2_www_burdock"] = {"response": res2.json()}
             except Exception:
-                results["2_burdock_path"] = {"status": res2.status_code, "text": res2.text[:300]}
+                results["2_www_burdock"] = {"status": res2.status_code, "text": res2.text[:300]}
         else:
-            results["2_burdock_path"] = {"response": res2}
+            results["2_www_burdock"] = {"response": res2}
     except Exception as e:
-        results["2_burdock_path"] = {"error": str(e)}
+        xhs._host = old_host if 'old_host' in dir() else "https://webapi.rednote.com"
+        results["2_www_burdock"] = {"error": str(e)}
 
-    # Approach 3: Try creator path (is_creator=True) in case the endpoint was added
+    # Approach 3: Try edith.xiaohongshu.com (Chinese host) — might not enforce XYS
     try:
-        res3 = xhs.post(uri, data, headers=headers, is_creator=True)
+        old_host = xhs._host
+        xhs._host = "https://edith.xiaohongshu.com"
+        res3 = xhs.post(uri, data, headers=headers)
+        xhs._host = old_host
         if hasattr(res3, 'status_code'):
             try:
-                results["3_creator_path"] = {"response": res3.json()}
+                results["3_edith_xiaohongshu"] = {"response": res3.json()}
             except Exception:
-                results["3_creator_path"] = {"status": res3.status_code, "text": res3.text[:300]}
+                results["3_edith_xiaohongshu"] = {"status": res3.status_code, "text": res3.text[:300]}
         else:
-            results["3_creator_path"] = {"response": res3}
+            results["3_edith_xiaohongshu"] = {"response": res3}
     except Exception as e:
-        results["3_creator_path"] = {"error": str(e)}
+        xhs._host = old_host if 'old_host' in dir() else "https://webapi.rednote.com"
+        results["3_edith_xiaohongshu"] = {"error": str(e)}
 
     return results
