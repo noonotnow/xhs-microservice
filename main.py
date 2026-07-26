@@ -8,7 +8,9 @@ import shutil
 import traceback
 from pathlib import Path
 
+import httpx
 from xhs import XhsClient
+from xhshow import Xhshow
 from sign_service import sign
 
 app = FastAPI(title="XHS Microservice", version="1.0.0")
@@ -120,6 +122,44 @@ def get_login_client() -> XhsClient:
     return login_client
 
 
+def _get_image_dimensions(filepath: str) -> tuple[int, int]:
+    """Get image width and height. Returns (width, height) or (1080, 1440) as fallback."""
+    try:
+        from struct import unpack
+
+        with open(filepath, "rb") as f:
+            header = f.read(32)
+
+        # JPEG
+        if header[:2] == b'\xff\xd8':
+            with open(filepath, "rb") as f:
+                f.read(2)
+                while True:
+                    marker = f.read(2)
+                    if len(marker) < 2:
+                        break
+                    if marker[0] != 0xFF:
+                        break
+                    if marker[1] in (0xC0, 0xC1, 0xC2):
+                        f.read(3)  # length + precision
+                        h = unpack(">H", f.read(2))[0]
+                        w = unpack(">H", f.read(2))[0]
+                        return (w, h)
+                    else:
+                        length = unpack(">H", f.read(2))[0]
+                        f.read(length - 2)
+
+        # PNG
+        if header[:8] == b'\x89PNG\r\n\x1a\n':
+            w = unpack(">I", header[16:20])[0]
+            h = unpack(">I", header[20:24])[0]
+            return (w, h)
+
+    except Exception:
+        pass
+    return (1080, 1440)
+
+
 def _patch_international_urls(xhs_client):
     """Monkey-patch the xhs library to route ALL calls through creator path.
 
@@ -163,45 +203,130 @@ def _patch_international_urls(xhs_client):
 
     xhs_client.get_suggest_topic = types.MethodType(patched_get_suggest_topic, xhs_client)
 
-    # Patch create_note: send to webapi.rednote.com (where /web_api/sns/v2/note exists)
-    # with correct Referer and all international cookies set.
-    # Note: sbtsource says this endpoint needs XYS_ signing, but we try with
-    # Python signing + correct cookies first. If that fails, we'll need XYS.
-    def patched_create_note(self, title, desc, note_type, ats=None, topics=None,
+    # Patch create_note: use xhshow library for XYS_ signing (required by /web_api/sns/v2/note)
+    def patched_create_note(self, title, desc, note_type="normal", ats=None, topics=None,
                             image_info=None, video_info=None, post_time=None, is_private=False):
-        from datetime import datetime as _dt
+        """Create a note using xhshow XYS_ signing for the webapi.rednote.com endpoint."""
         import json as _json
 
         if ats is None:
             ats = []
         if topics is None:
             topics = []
-        if post_time:
-            post_date_time = _dt.strptime(post_time, "%Y-%m-%d %H:%M:%S")
-            post_time = round(int(post_date_time.timestamp()) * 1000)
 
-        uri = "/web_api/sns/v2/note"
-        business_binds = {
-            "version": 1, "noteId": 0, "noteOrderBind": {},
-            "notePostTiming": {"postTime": post_time},
-            "noteCollectionBind": {"id": ""}
-        }
-        data = {
+        # Build confirmed-working request body format
+        business_binds = _json.dumps({
+            "version": 1, "noteId": 0, "bizType": 0,
+            "noteOrderBind": {},
+            "notePostTiming": {},
+            "noteCollectionBind": {"id": ""},
+            "noteSketchCollectionBind": {"id": ""},
+            "coProduceBind": {"enable": True},
+            "noteCopyBind": {"copyable": True},
+            "interactionPermissionBind": {"commentPermission": 0},
+            "optionRelationList": []
+        }, separators=(",", ":"))
+
+        note_type_str = note_type if isinstance(note_type, str) else "normal"
+        payload = {
             "common": {
-                "type": note_type, "title": title, "note_id": "", "desc": desc,
-                "source": '{"type":"web","ids":"","extraInfo":"{\\"subType\\":\\"official\\"}"}',
-                "business_binds": _json.dumps(business_binds, separators=(",", ":")),
-                "ats": ats, "hash_tag": topics, "post_loc": {},
+                "type": note_type_str,
+                "note_id": "",
+                "source": _json.dumps({"type": "web", "ids": "", "extraInfo": _json.dumps({"systemId": "web"})}, separators=(",", ":")),
+                "title": title,
+                "desc": desc,
+                "ats": ats,
+                "hash_tag": topics,
+                "business_binds": business_binds,
                 "privacy_info": {"op_type": 1, "type": int(is_private)},
+                "goods_info": {},
+                "biz_relations": [],
+                "capa_trace_info": {
+                    "contextJson": _json.dumps({
+                        "recommend_title": {"recommend_title_id": "", "is_use": 3, "used_index": -1},
+                        "recommendTitle": [],
+                        "recommend_topics": {"used": []}
+                    }, separators=(",", ":"))
+                }
             },
             "image_info": image_info,
             "video_info": video_info,
         }
-        headers = {
-            "Referer": "https://creator.rednote.com/publish/publish",
+
+        # Extract cookies from client's session
+        cookie_str = self.cookie or ""
+        cookies_dict = {}
+        for part in cookie_str.split(";"):
+            part = part.strip()
+            if "=" in part:
+                k, v = part.split("=", 1)
+                cookies_dict[k.strip()] = v.strip()
+
+        # Also grab cookies from session cookie jar
+        for cookie in self.session.cookies:
+            cookies_dict[cookie.name] = cookie.value
+
+        # Generate XYS_ signed headers using xhshow
+        xhshow_client = Xhshow()
+        url = "https://webapi.rednote.com/web_api/sns/v2/note"
+
+        sign_cookies = {
+            "a1": cookies_dict.get("a1", ""),
+            "web_session": cookies_dict.get("web_session", ""),
+            "webId": cookies_dict.get("webId", ""),
         }
-        # Goes to webapi.rednote.com (default _host) with Python signing
-        return self.post(uri, data, headers=headers)
+
+        try:
+            signed_headers = xhshow_client.sign_headers_post(
+                uri=url,
+                cookies=sign_cookies,
+                payload=payload,
+                x_rap=True,
+            )
+        except Exception:
+            # Fallback: try with just the path
+            signed_headers = xhshow_client.sign_headers_post(
+                uri="/web_api/sns/v2/note",
+                cookies=sign_cookies,
+                payload=payload,
+                x_rap=True,
+            )
+
+        # Build full headers
+        request_headers = {
+            "Content-Type": "application/json",
+            "Referer": "https://creator.rednote.com/",
+            "Origin": "https://creator.rednote.com",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-site",
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+        }
+        # Merge xhshow signed headers (x-s, x-s-common, x-t, x-rap-param, etc.)
+        for k, v in signed_headers.items():
+            request_headers[k] = str(v)
+
+        # Build cookie header string
+        cookie_parts = []
+        for k, v in cookies_dict.items():
+            cookie_parts.append(f"{k}={v}")
+        request_headers["Cookie"] = "; ".join(cookie_parts)
+
+        # Make direct POST request
+        with httpx.Client(timeout=30) as http_client:
+            resp = http_client.post(url, json=payload, headers=request_headers)
+
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("code") == 0 or data.get("success"):
+                return data.get("data", data)
+            return data
+        else:
+            return {
+                "error": True,
+                "status_code": resp.status_code,
+                "response": resp.text[:500],
+            }
 
     xhs_client.create_note = types.MethodType(patched_create_note, xhs_client)
 
@@ -331,26 +456,33 @@ def publish_note(req: PublishRequest, x_api_key: str | None = Header(None)):
         upload_resp = xhs.upload_file(image_id, token, req.files[0])
         steps["2_upload"] = {"ok": True, "status": getattr(upload_resp, 'status_code', 'unknown')}
 
-        # Step 3: Create note
+        # Step 3: Get image dimensions and size for the payload
+        file_size_kb = os.path.getsize(req.files[0]) / 1024
+        img_width, img_height = _get_image_dimensions(req.files[0])
+
+        # Step 4: Create note with xhshow-signed request
         images = [{
             "file_id": image_id,
+            "width": img_width,
+            "height": img_height,
             "metadata": {"source": -1},
             "stickers": {"version": 2, "floating": []},
-            "extra_info_json": '{"mimeType":"image/jpeg"}',
+            "extra_info_json": json.dumps({
+                "mimeType": "image/jpeg",
+                "image_metadata": {"bg_color": "", "origin_size": round(file_size_kb)}
+            }, separators=(",", ":")),
         }]
         result = xhs.create_note(
             title=req.title,
             desc=req.desc,
-            note_type=1,
+            note_type="normal",
             topics=topics,
             image_info={"images": images},
             is_private=req.is_private,
-            post_time=req.post_time,
         )
         steps["3_create_note"] = {"ok": True}
         # Ensure result is JSON-serializable
         if hasattr(result, 'status_code'):
-            # It's a requests.Response object
             try:
                 result = result.json()
             except Exception:

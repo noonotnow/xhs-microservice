@@ -4,3 +4,5 @@ xhs==0.2.13
 playwright==1.47.0
 python-multipart==0.0.9
 playwright-stealth
+xhshow
+httpx
