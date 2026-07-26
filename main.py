@@ -295,6 +295,7 @@ def _patch_international_urls(xhs_client):
         # Build full headers
         request_headers = {
             "Content-Type": "application/json",
+            "Authorization": "",
             "Referer": "https://creator.rednote.com/",
             "Origin": "https://creator.rednote.com",
             "Sec-Fetch-Dest": "empty",
@@ -312,8 +313,30 @@ def _patch_international_urls(xhs_client):
             cookie_parts.append(f"{k}={v}")
         request_headers["Cookie"] = "; ".join(cookie_parts)
 
-        # Make direct POST request
+        # Make direct POST request, using a session to acquire acw_tc cookie
         with httpx.Client(timeout=30) as http_client:
+            # Preflight: hit webapi.rednote.com to acquire domain-specific acw_tc cookie
+            try:
+                preflight_headers = {
+                    "User-Agent": request_headers["User-Agent"],
+                    "Cookie": request_headers["Cookie"],
+                    "Referer": "https://creator.rednote.com/",
+                }
+                preflight_resp = http_client.get(
+                    "https://webapi.rednote.com/api/sns/web/v1/user/selfinfo",
+                    headers=preflight_headers,
+                )
+                # Extract acw_tc from response cookies and add to our cookie header
+                for cookie_name, cookie_value in http_client.cookies.items():
+                    if cookie_name == "acw_tc":
+                        cookies_dict["acw_tc"] = cookie_value
+                        # Rebuild cookie header with acw_tc
+                        cookie_parts = [f"{k}={v}" for k, v in cookies_dict.items()]
+                        request_headers["Cookie"] = "; ".join(cookie_parts)
+                        break
+            except Exception:
+                pass  # Continue without acw_tc if preflight fails
+
             resp = http_client.post(url, json=payload, headers=request_headers)
 
         if resp.status_code == 200:
