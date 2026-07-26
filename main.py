@@ -163,9 +163,10 @@ def _patch_international_urls(xhs_client):
 
     xhs_client.get_suggest_topic = types.MethodType(patched_get_suggest_topic, xhs_client)
 
-    # Patch create_note to use creator path (is_creator=True) to bypass XYS signature requirement.
-    # The sbtsource security config shows /web_api/sns/v2/note requires XYS_ signing
-    # when called through webapi.rednote.com, but creator-path uses Python signing which works.
+    # Patch create_note: send to webapi.rednote.com (where /web_api/sns/v2/note exists)
+    # with correct Referer and all international cookies set.
+    # Note: sbtsource says this endpoint needs XYS_ signing, but we try with
+    # Python signing + correct cookies first. If that fails, we'll need XYS.
     def patched_create_note(self, title, desc, note_type, ats=None, topics=None,
                             image_info=None, video_info=None, post_time=None, is_private=False):
         from datetime import datetime as _dt
@@ -199,10 +200,8 @@ def _patch_international_urls(xhs_client):
         headers = {
             "Referer": "https://creator.rednote.com/publish/publish",
         }
-        # Route through creator.rednote.com with is_creator=True
-        # This uses Python signing (quick_sign) which includes x-s-common
-        # and bypasses the XYS_ signature requirement on webapi.rednote.com
-        return self.post(uri, data, headers=headers, is_creator=True)
+        # Goes to webapi.rednote.com (default _host) with Python signing
+        return self.post(uri, data, headers=headers)
 
     xhs_client.create_note = types.MethodType(patched_create_note, xhs_client)
 
@@ -612,49 +611,63 @@ def debug_test_create_note(x_api_key: str | None = Header(None)):
         results["0_auth"] = {"ok": False, "error": str(e)}
         return results
 
-    # Try create_note through creator path (is_creator=True)
+    uri = "/web_api/sns/v2/note"
+    data = {
+        "common": {
+            "type": 1, "title": "API test (will delete)", "note_id": "",
+            "desc": "Testing API connectivity - private post",
+            "source": '{"type":"web","ids":"","extraInfo":"{\\"subType\\":\\"official\\"}"}',
+            "business_binds": _json.dumps({
+                "version": 1, "noteId": 0, "noteOrderBind": {},
+                "notePostTiming": {"postTime": ""},
+                "noteCollectionBind": {"id": ""}
+            }, separators=(",", ":")),
+            "ats": [], "hash_tag": [], "post_loc": {},
+            "privacy_info": {"op_type": 1, "type": 1},  # PRIVATE
+        },
+        "image_info": {"images": []},
+        "video_info": None,
+    }
+    headers = {"Referer": "https://creator.rednote.com/publish/publish"}
+
+    # Approach 1: webapi.rednote.com (default host, no is_creator)
     try:
-        uri = "/web_api/sns/v2/note"
-        data = {
-            "common": {
-                "type": 1, "title": "API test (will delete)", "note_id": "",
-                "desc": "Testing API connectivity - private post",
-                "source": '{"type":"web","ids":"","extraInfo":"{\\"subType\\":\\"official\\"}"}',
-                "business_binds": _json.dumps({
-                    "version": 1, "noteId": 0, "noteOrderBind": {},
-                    "notePostTiming": {"postTime": ""},
-                    "noteCollectionBind": {"id": ""}
-                }, separators=(",", ":")),
-                "ats": [], "hash_tag": [], "post_loc": {},
-                "privacy_info": {"op_type": 1, "type": 1},  # PRIVATE
-            },
-            "image_info": {"images": []},
-            "video_info": None,
-        }
-        headers = {"Referer": "https://creator.rednote.com/publish/publish"}
-        res = xhs.post(uri, data, headers=headers, is_creator=True)
+        res = xhs.post(uri, data, headers=headers)
         if hasattr(res, 'status_code'):
             try:
-                results["1_creator_path"] = {"ok": True, "response": res.json()}
+                results["1_webapi_path"] = {"response": res.json()}
             except Exception:
-                results["1_creator_path"] = {"ok": True, "status": res.status_code, "text": res.text[:300]}
+                results["1_webapi_path"] = {"status": res.status_code, "text": res.text[:300]}
         else:
-            results["1_creator_path"] = {"ok": True, "response": res}
+            results["1_webapi_path"] = {"response": res}
     except Exception as e:
-        results["1_creator_path"] = {"ok": False, "error": str(e)}
+        results["1_webapi_path"] = {"error": str(e)}
 
-    # If creator path failed, try webapi.rednote.com (without is_creator)
-    if not results.get("1_creator_path", {}).get("ok"):
-        try:
-            res = xhs.post(uri, data, headers=headers)
-            if hasattr(res, 'status_code'):
-                try:
-                    results["2_webapi_path"] = {"ok": True, "response": res.json()}
-                except Exception:
-                    results["2_webapi_path"] = {"ok": True, "status": res.status_code, "text": res.text[:300]}
-            else:
-                results["2_webapi_path"] = {"ok": True, "response": res}
-        except Exception as e:
-            results["2_webapi_path"] = {"ok": False, "error": str(e)}
+    # Approach 2: Try /fe_api/burdock/v2/note/post (alternative endpoint from commonPatch)
+    try:
+        burdock_uri = "/fe_api/burdock/v2/note/post"
+        res2 = xhs.post(burdock_uri, data, headers=headers)
+        if hasattr(res2, 'status_code'):
+            try:
+                results["2_burdock_path"] = {"response": res2.json()}
+            except Exception:
+                results["2_burdock_path"] = {"status": res2.status_code, "text": res2.text[:300]}
+        else:
+            results["2_burdock_path"] = {"response": res2}
+    except Exception as e:
+        results["2_burdock_path"] = {"error": str(e)}
+
+    # Approach 3: Try creator path (is_creator=True) in case the endpoint was added
+    try:
+        res3 = xhs.post(uri, data, headers=headers, is_creator=True)
+        if hasattr(res3, 'status_code'):
+            try:
+                results["3_creator_path"] = {"response": res3.json()}
+            except Exception:
+                results["3_creator_path"] = {"status": res3.status_code, "text": res3.text[:300]}
+        else:
+            results["3_creator_path"] = {"response": res3}
+    except Exception as e:
+        results["3_creator_path"] = {"error": str(e)}
 
     return results
