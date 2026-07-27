@@ -173,6 +173,58 @@ def _get_image_dimensions(filepath: str) -> tuple[int, int]:
     return (1080, 1440)
 
 
+def _get_video_metadata(filepath: str) -> dict:
+    """Extract video metadata using ffprobe, with sensible fallback defaults."""
+    import subprocess as _sp
+    try:
+        cmd = [
+            'ffprobe', '-v', 'quiet', '-print_format', 'json',
+            '-show_format', '-show_streams', filepath
+        ]
+        proc = _sp.run(cmd, capture_output=True, text=True, timeout=10)
+        if proc.returncode == 0:
+            probe = json.loads(proc.stdout)
+            video_stream = next((s for s in probe.get('streams', []) if s.get('codec_type') == 'video'), {})
+            audio_stream = next((s for s in probe.get('streams', []) if s.get('codec_type') == 'audio'), {})
+            fmt = probe.get('format', {})
+
+            width = int(video_stream.get('width', 0))
+            height = int(video_stream.get('height', 0))
+            duration_s = float(fmt.get('duration', 0))
+            video_bitrate = int(video_stream.get('bit_rate', 0))
+            fps_parts = video_stream.get('r_frame_rate', '30/1').split('/')
+            fps = round(int(fps_parts[0]) / int(fps_parts[1]), 2) if len(fps_parts) == 2 and int(fps_parts[1]) > 0 else 30.0
+            audio_bitrate = int(audio_stream.get('bit_rate', 64000))
+            audio_channels = int(audio_stream.get('channels', 1))
+            audio_sample_rate = int(audio_stream.get('sample_rate', 44100))
+
+            return {
+                "width": width or 1080,
+                "height": height or 1920,
+                "duration_s": duration_s or 30.0,
+                "duration_ms": int(duration_s * 1000) if duration_s else 30000,
+                "video_bitrate": video_bitrate or 5000000,
+                "fps": fps,
+                "audio_bitrate": audio_bitrate,
+                "audio_channels": audio_channels,
+                "audio_sample_rate": audio_sample_rate,
+            }
+    except Exception:
+        pass
+    # Fallback defaults
+    return {
+        "width": 1080,
+        "height": 1920,
+        "duration_s": 30.0,
+        "duration_ms": 30000,
+        "video_bitrate": 5000000,
+        "fps": 30.0,
+        "audio_bitrate": 64000,
+        "audio_channels": 1,
+        "audio_sample_rate": 44100,
+    }
+
+
 def _patch_international_urls(xhs_client):
     """Monkey-patch the xhs library to route ALL calls through creator path.
 
@@ -554,7 +606,19 @@ def publish_note(req: PublishRequest, x_api_key: str | None = Header(None)):
                 result = {"response_status": result.status_code, "response_text": result.text[:200] if result.text else "empty"}
         elif not isinstance(result, (dict, list, str, int, float, bool, type(None))):
             result = str(result)
-        return {"status": "success", "data": result, "steps": steps}
+
+        note_id = None
+        share_link = None
+        if isinstance(result, dict):
+            note_id = result.get("id") or (result.get("data", {}).get("id") if isinstance(result.get("data"), dict) else None)
+            share_link = result.get("share_link")
+
+        response = {"status": "success", "data": result, "steps": steps}
+        if note_id:
+            response["note_id"] = note_id
+        if share_link:
+            response["share_link"] = share_link
+        return response
     except Exception as e:
         import traceback
         return {"status": "error", "detail": str(e), "traceback": traceback.format_exc()}
@@ -637,19 +701,64 @@ def publish_video(req: VideoPublishRequest, x_api_key: str | None = Header(None)
             cover_width, cover_height = 0, 0  # Unknown for auto-frame
 
         # Step 4: Build video_info and create note
+        vmeta = _get_video_metadata(req.video_file)
+
         cover_info = {
             "file_id": cover_file_id,
+            "fileid": cover_file_id,
             "width": cover_width,
             "height": cover_height,
+            "extra_info_json": "{}",
+            "fonts": [],
+            "stickers": {"neptune": [], "version": 2},
             "frame": {"ts": 0, "is_user_select": is_upload_cover, "is_upload": is_upload_cover},
         }
         video_info = {
             "file_id": video_file_id,
+            "fileid": video_file_id,
             "timelines": [],
             "cover": cover_info,
             "chapters": [],
             "chapter_sync_text": False,
             "entrance": "web",
+            "format_width": vmeta["width"],
+            "format_height": vmeta["height"],
+            "video_preview_type": "full_vertical_screen",
+            "pk_cover_biz_relations": [],
+            "segments": {
+                "count": 1,
+                "need_slice": False,
+                "items": [{
+                    "mute": 0,
+                    "speed": 1,
+                    "start": 0,
+                    "duration": vmeta["duration_s"],
+                    "transcoded": 0,
+                    "media_source": 1,
+                    "original_metadata": {}
+                }]
+            },
+            "composite_metadata": {
+                "audio": {
+                    "bitrate": vmeta["audio_bitrate"],
+                    "channels": vmeta["audio_channels"],
+                    "duration": vmeta["duration_ms"],
+                    "format": "AAC",
+                    "sampling_rate": vmeta["audio_sample_rate"],
+                },
+                "video": {
+                    "bitrate": vmeta["video_bitrate"],
+                    "colour_primaries": "BT.709",
+                    "duration": vmeta["duration_ms"],
+                    "format": "AVC",
+                    "frame_rate": vmeta["fps"],
+                    "height": vmeta["height"],
+                    "matrix_coefficients": "BT.601",
+                    "rotation": 0,
+                    "transfer_characteristics": "BT.709",
+                    "width": vmeta["width"],
+                },
+            },
         }
 
         result = xhs.create_note(
@@ -671,7 +780,17 @@ def publish_video(req: VideoPublishRequest, x_api_key: str | None = Header(None)
         elif not isinstance(result, (dict, list, str, int, float, bool, type(None))):
             result = str(result)
 
+        note_id = None
+        share_link = None
+        if isinstance(result, dict):
+            note_id = result.get("id") or (result.get("data", {}).get("id") if isinstance(result.get("data"), dict) else None)
+            share_link = result.get("share_link")
+
         response = {"status": "success", "data": result, "steps": steps}
+        if note_id:
+            response["note_id"] = note_id
+        if share_link:
+            response["share_link"] = share_link
         if not req.cover_file:
             response["warning"] = (
                 "No cover_file was provided. Auto first-frame was used, which may "
