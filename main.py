@@ -188,6 +188,16 @@ def _patch_international_urls(xhs_client):
 
     xhs_client.get_upload_files_permit = types.MethodType(patched_get_upload_files_permit, xhs_client)
 
+    # Patch upload_file to use international CDN (upload.rnote.com instead of ros-upload.xiaohongshu.com)
+    def patched_upload_file(self, file_id, token, file_path, content_type="image/jpeg"):
+        """Upload file to international CDN at upload.rnote.com"""
+        url = "https://upload.rnote.com/" + file_id
+        headers = {"X-Cos-Security-Token": token, "Content-Type": content_type}
+        with open(file_path, "rb") as f:
+            return self.request("PUT", url, data=f, headers=headers)
+
+    xhs_client.upload_file = types.MethodType(patched_upload_file, xhs_client)
+
     # Patch get_suggest_topic to use creator path
     def patched_get_suggest_topic(self, keyword=""):
         uri = "/web_api/sns/v1/search/topic"
