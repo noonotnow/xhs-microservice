@@ -213,6 +213,19 @@ def _patch_international_urls(xhs_client):
 
     xhs_client.get_suggest_topic = types.MethodType(patched_get_suggest_topic, xhs_client)
 
+    # Patch get_video_first_frame_image_id to use creator path
+    def patched_get_video_first_frame_image_id(self, video_id):
+        """Get the auto-generated first-frame cover image ID for an uploaded video."""
+        uri = "/api/media/v1/upload/web/first_frame"
+        params = {"video_id": video_id}
+        res = self.get(uri, params, is_creator=True)
+        # Response contains the file_id of the auto-generated first frame
+        return res.get("file_id", "")
+
+    xhs_client.get_video_first_frame_image_id = types.MethodType(
+        patched_get_video_first_frame_image_id, xhs_client
+    )
+
     # Patch create_note: use xhshow library for XYS_ signing (required by /web_api/sns/v2/note)
     def patched_create_note(self, title, desc, note_type="normal", ats=None, topics=None,
                             image_info=None, video_info=None, post_time=None, is_private=False):
@@ -481,30 +494,36 @@ def publish_note(req: PublishRequest, x_api_key: str | None = Header(None)):
         # Step-by-step publishing with detailed error reporting
         steps = {}
 
-        # Step 1: Get upload permit
-        image_id, token = xhs.get_upload_files_permit("image")
-        steps["1_permit"] = {"ok": True, "file_id": image_id[:30]}
+        # Upload each image file: get permit, upload to CDN, collect image entries
+        images = []
+        for i, filepath in enumerate(req.files):
+            n = i + 1
 
-        # Step 2: Upload file to CDN
-        upload_resp = xhs.upload_file(image_id, token, req.files[0])
-        steps["2_upload"] = {"ok": True, "status": getattr(upload_resp, 'status_code', 'unknown')}
+            # Get upload permit for this file
+            image_id, token = xhs.get_upload_files_permit("image")
+            steps[f"{n}_permit"] = {"ok": True, "file_id": image_id[:30]}
 
-        # Step 3: Get image dimensions and size for the payload
-        file_size_kb = os.path.getsize(req.files[0]) / 1024
-        img_width, img_height = _get_image_dimensions(req.files[0])
+            # Upload file to CDN
+            upload_resp = xhs.upload_file(image_id, token, filepath)
+            steps[f"{n}_upload"] = {"ok": True, "status": getattr(upload_resp, 'status_code', 'unknown')}
 
-        # Step 4: Create note with xhshow-signed request
-        images = [{
-            "file_id": image_id,
-            "width": img_width,
-            "height": img_height,
-            "metadata": {"source": -1},
-            "stickers": {"version": 2, "floating": []},
-            "extra_info_json": json.dumps({
-                "mimeType": "image/jpeg",
-                "image_metadata": {"bg_color": "", "origin_size": round(file_size_kb)}
-            }, separators=(",", ":")),
-        }]
+            # Get image dimensions and size for the payload
+            file_size_kb = os.path.getsize(filepath) / 1024
+            img_width, img_height = _get_image_dimensions(filepath)
+
+            images.append({
+                "file_id": image_id,
+                "width": img_width,
+                "height": img_height,
+                "metadata": {"source": -1},
+                "stickers": {"version": 2, "floating": []},
+                "extra_info_json": json.dumps({
+                    "mimeType": "image/jpeg",
+                    "image_metadata": {"bg_color": "", "origin_size": round(file_size_kb)}
+                }, separators=(",", ":")),
+            })
+
+        # Create note with all images
         result = xhs.create_note(
             title=req.title,
             desc=req.desc,
@@ -513,7 +532,111 @@ def publish_note(req: PublishRequest, x_api_key: str | None = Header(None)):
             image_info={"images": images},
             is_private=req.is_private,
         )
-        steps["3_create_note"] = {"ok": True}
+        steps["create_note"] = {"ok": True}
+        # Ensure result is JSON-serializable
+        if hasattr(result, 'status_code'):
+            try:
+                result = result.json()
+            except Exception:
+                result = {"response_status": result.status_code, "response_text": result.text[:200] if result.text else "empty"}
+        elif not isinstance(result, (dict, list, str, int, float, bool, type(None))):
+            result = str(result)
+        return {"status": "success", "data": result, "steps": steps}
+    except Exception as e:
+        import traceback
+        return {"status": "error", "detail": str(e), "traceback": traceback.format_exc()}
+
+
+# --- Video Publish ---
+class VideoPublishRequest(BaseModel):
+    title: str
+    desc: str
+    video_file: str  # Local file path from /upload
+    cover_file: str | None = None  # Optional cover image path
+    topic_keywords: list[str] = []
+    is_private: bool = False
+
+
+@app.post("/publish-video")
+def publish_video(req: VideoPublishRequest, x_api_key: str | None = Header(None)):
+    require_api_key(x_api_key)
+    try:
+        xhs = get_client()
+        steps = {}
+
+        if not os.path.exists(req.video_file):
+            return {"status": "error", "detail": f"Video file not found: {req.video_file}"}
+        if req.cover_file and not os.path.exists(req.cover_file):
+            return {"status": "error", "detail": f"Cover file not found: {req.cover_file}"}
+
+        # Look up topics if keywords provided
+        topics = []
+        for keyword in req.topic_keywords:
+            try:
+                suggestions = xhs.get_suggest_topic(keyword)
+                if suggestions:
+                    topics.append(suggestions[0])
+            except Exception:
+                pass
+
+        # Step 1: Get video upload permit
+        video_file_id, video_token = xhs.get_upload_files_permit("video")
+        steps["1_video_permit"] = {"ok": True, "file_id": video_file_id[:30]}
+
+        # Step 2: Upload video to CDN
+        upload_resp = xhs.upload_file(video_file_id, video_token, req.video_file, content_type="video/mp4")
+        video_id = upload_resp.headers.get("X-Ros-Video-Id", "")
+        steps["2_video_upload"] = {"ok": True, "video_id": video_id}
+
+        # Step 3: Handle cover image
+        cover_file_id = None
+        is_upload_cover = False
+
+        if req.cover_file:
+            # Upload custom cover image
+            cover_file_id, cover_token = xhs.get_upload_files_permit("image")
+            xhs.upload_file(cover_file_id, cover_token, req.cover_file)
+            is_upload_cover = True
+            steps["3_cover"] = {"ok": True, "type": "custom", "file_id": cover_file_id[:30]}
+        else:
+            # Wait for auto-generated first frame from video
+            import time
+            for attempt in range(10):
+                time.sleep(3)
+                try:
+                    cover_file_id = xhs.get_video_first_frame_image_id(video_id)
+                    if cover_file_id:
+                        steps["3_cover"] = {"ok": True, "type": "auto_frame", "attempts": attempt + 1}
+                        break
+                except Exception:
+                    pass
+            if not cover_file_id:
+                return {"status": "error", "detail": "Could not get video cover frame after 30s", "steps": steps}
+
+        # Step 4: Build video_info and create note
+        cover_info = {
+            "file_id": cover_file_id,
+            "frame": {"ts": 0, "is_user_select": False, "is_upload": is_upload_cover},
+        }
+        video_info = {
+            "file_id": video_file_id,
+            "timelines": [],
+            "cover": cover_info,
+            "chapters": [],
+            "chapter_sync_text": False,
+            "entrance": "web",
+        }
+
+        result = xhs.create_note(
+            title=req.title,
+            desc=req.desc,
+            note_type="video",
+            topics=topics,
+            video_info=video_info,
+            is_private=req.is_private,
+        )
+        steps["4_create_note"] = {"ok": True}
+
         # Ensure result is JSON-serializable
         if hasattr(result, 'status_code'):
             try:
