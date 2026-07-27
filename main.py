@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import os
@@ -14,6 +15,18 @@ from xhshow import Xhshow
 from sign_service import sign
 
 app = FastAPI(title="XHS Microservice", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://xhs-platform.vercel.app",
+        "https://xhs.justlikekatie.com",
+        "http://localhost:3000",  # local dev
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.exception_handler(Exception)
