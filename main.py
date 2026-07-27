@@ -597,10 +597,13 @@ def publish_video(req: VideoPublishRequest, x_api_key: str | None = Header(None)
             cover_file_id, cover_token = xhs.get_upload_files_permit("image")
             xhs.upload_file(cover_file_id, cover_token, req.cover_file)
             is_upload_cover = True
-            steps["3_cover"] = {"ok": True, "type": "custom", "file_id": cover_file_id[:30]}
+            cover_width, cover_height = _get_image_dimensions(req.cover_file)
+            steps["3_cover"] = {"ok": True, "type": "custom", "file_id": cover_file_id[:30],
+                                "width": cover_width, "height": cover_height}
         else:
-            # Wait for auto-generated first frame from video
+            # No cover provided — try auto-generated first frame (less reliable)
             import time
+            auto_frame_errors = []
             for attempt in range(10):
                 time.sleep(3)
                 try:
@@ -608,15 +611,24 @@ def publish_video(req: VideoPublishRequest, x_api_key: str | None = Header(None)
                     if cover_file_id:
                         steps["3_cover"] = {"ok": True, "type": "auto_frame", "attempts": attempt + 1}
                         break
-                except Exception:
-                    pass
+                except Exception as frame_err:
+                    auto_frame_errors.append(f"attempt {attempt + 1}: {frame_err}")
             if not cover_file_id:
-                return {"status": "error", "detail": "Could not get video cover frame after 30s", "steps": steps}
+                steps["3_cover_errors"] = auto_frame_errors
+                return {
+                    "status": "error",
+                    "detail": "Could not get video cover frame after 30s. "
+                              "Strongly recommend providing a cover_file for reliable results.",
+                    "steps": steps,
+                }
+            cover_width, cover_height = 0, 0  # Unknown for auto-frame
 
         # Step 4: Build video_info and create note
         cover_info = {
             "file_id": cover_file_id,
-            "frame": {"ts": 0, "is_user_select": False, "is_upload": is_upload_cover},
+            "width": cover_width,
+            "height": cover_height,
+            "frame": {"ts": 0, "is_user_select": is_upload_cover, "is_upload": is_upload_cover},
         }
         video_info = {
             "file_id": video_file_id,
@@ -645,7 +657,14 @@ def publish_video(req: VideoPublishRequest, x_api_key: str | None = Header(None)
                 result = {"response_status": result.status_code, "response_text": result.text[:200] if result.text else "empty"}
         elif not isinstance(result, (dict, list, str, int, float, bool, type(None))):
             result = str(result)
-        return {"status": "success", "data": result, "steps": steps}
+
+        response = {"status": "success", "data": result, "steps": steps}
+        if not req.cover_file:
+            response["warning"] = (
+                "No cover_file was provided. Auto first-frame was used, which may "
+                "produce null cover URLs. Providing a cover_file is strongly recommended."
+            )
+        return response
     except Exception as e:
         import traceback
         return {"status": "error", "detail": str(e), "traceback": traceback.format_exc()}
