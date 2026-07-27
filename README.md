@@ -8,7 +8,7 @@ Handles QR login, session persistence, image upload, and note publishing/schedul
 
 ```
 Next.js (xhs-platform)
-    ↓ HTTP + API key
+    ↓ HTTP + API key (server) or short-lived upload token (browser)
 This Microservice (FastAPI + Playwright)
     ↓ Signed requests
 Real Xiaohongshu API
@@ -25,7 +25,31 @@ Real Xiaohongshu API
 | POST | `/upload` | Upload an image file (returns local path) |
 | POST | `/publish` | Publish or schedule a note |
 
-All endpoints (except `/health`) require `X-Api-Key` header.
+All endpoints except `/health` require the permanent `X-Api-Key` header. For
+backward compatibility, `/upload` accepts that header or a short-lived
+`Authorization: Upload <token>` header. Upload tokens are not accepted by any
+other endpoint.
+
+### Browser Upload Authorization
+
+The server that renders the browser client should generate a fresh upload token
+instead of exposing `XHS_API_KEY`. The token format is:
+
+```text
+<payload_b64url>.<signature_b64url>
+```
+
+Both segments use unpadded base64url. The payload is compact UTF-8 JSON with
+these fields:
+
+```json
+{"exp":1750000000,"method":"POST","path":"/upload","nonce":"unique-random-value"}
+```
+
+Sign the ASCII payload segment with HMAC-SHA256 using
+`UPLOAD_TOKEN_SECRET`, then base64url-encode the signature without padding.
+`exp` is Unix seconds and must be in the future but no more than five minutes
+ahead. Use a separate high-entropy secret from `XHS_API_KEY`.
 
 ## QR Login Flow
 
@@ -49,7 +73,8 @@ XHS handles the actual publishing at the scheduled time.
 1. Push to GitHub
 2. Connect repo in Railway
 3. Add a volume mount at `/app/data` (stores cookies, state, and uploads)
-4. Set env var: `XHS_API_KEY=<your-secret>`
+4. Set env vars `XHS_API_KEY=<your-secret>` and
+   `UPLOAD_TOKEN_SECRET=<your-independent-high-entropy-secret>`
 5. Deploy
 
 ## Local Development
@@ -57,7 +82,7 @@ XHS handles the actual publishing at the scheduled time.
 ```bash
 pip install -r requirements.txt
 playwright install chromium
-XHS_API_KEY=test DATA_DIR=./data UPLOAD_DIR=./uploads uvicorn main:app --reload
+XHS_API_KEY=test UPLOAD_TOKEN_SECRET=upload-test-secret DATA_DIR=./data UPLOAD_DIR=./uploads uvicorn main:app --reload
 ```
 
 ## Important Notes

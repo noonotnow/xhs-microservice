@@ -2,8 +2,14 @@ from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+import base64
+import binascii
+import hashlib
+import hmac
 import os
 import json
+import re
+import time
 import uuid
 import shutil
 import traceback
@@ -38,10 +44,13 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 # --- Config ---
 API_KEY = os.getenv("XHS_API_KEY", "change-me-in-production")
+UPLOAD_TOKEN_SECRET = os.getenv("UPLOAD_TOKEN_SECRET")
 DATA_DIR = os.getenv("DATA_DIR", "/app/data")
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/app/data/uploads")
 COOKIE_FILE = os.path.join(DATA_DIR, "cookie.json")
 QR_STATE_FILE = os.path.join(DATA_DIR, "qr_state.json")
+UPLOAD_TOKEN_MAX_LIFETIME_SECONDS = 5 * 60
+BASE64URL_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 # --- Persistent client (singleton) ---
 client: XhsClient | None = None
@@ -51,6 +60,87 @@ login_client: XhsClient | None = None
 def require_api_key(x_api_key: str | None):
     if x_api_key != API_KEY:
         raise HTTPException(status_code=403, detail="Invalid API key")
+
+
+def _decode_base64url_segment(segment: str) -> bytes:
+    if not BASE64URL_SEGMENT_RE.fullmatch(segment):
+        raise ValueError("Invalid base64url segment")
+    padding = "=" * (-len(segment) % 4)
+    try:
+        return base64.b64decode(
+            segment + padding,
+            altchars=b"-_",
+            validate=True,
+        )
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("Invalid base64url segment") from exc
+
+
+def _reject_duplicate_json_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def validate_upload_token(token: str) -> bool:
+    if not UPLOAD_TOKEN_SECRET:
+        raise HTTPException(
+            status_code=503,
+            detail="Upload token authentication is not configured",
+        )
+
+    try:
+        payload_segment, signature_segment = token.split(".")
+        payload_bytes = _decode_base64url_segment(payload_segment)
+        supplied_signature = _decode_base64url_segment(signature_segment)
+
+        expected_signature = hmac.new(
+            UPLOAD_TOKEN_SECRET.encode("utf-8"),
+            payload_segment.encode("ascii"),
+            hashlib.sha256,
+        ).digest()
+        if not hmac.compare_digest(supplied_signature, expected_signature):
+            return False
+
+        payload = json.loads(
+            payload_bytes.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ValueError(f"Invalid JSON constant: {value}")
+            ),
+        )
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return False
+
+    if not isinstance(payload, dict):
+        return False
+    if type(payload.get("exp")) is not int:
+        return False
+    if payload.get("method") != "POST" or type(payload.get("method")) is not str:
+        return False
+    if payload.get("path") != "/upload" or type(payload.get("path")) is not str:
+        return False
+    if type(payload.get("nonce")) is not str:
+        return False
+
+    now = int(time.time())
+    return now < payload["exp"] <= now + UPLOAD_TOKEN_MAX_LIFETIME_SECONDS
+
+
+def require_upload_authorization(
+    x_api_key: str | None,
+    authorization: str | None,
+):
+    if x_api_key == API_KEY:
+        return
+    if authorization and authorization.startswith("Upload "):
+        token = authorization.removeprefix("Upload ")
+        if token and validate_upload_token(token):
+            return
+    raise HTTPException(status_code=403, detail="Invalid upload authorization")
 
 
 def load_cookie() -> str:
@@ -515,8 +605,9 @@ def session_status(x_api_key: str | None = Header(None)):
 async def upload_image(
     file: UploadFile = File(...),
     x_api_key: str | None = Header(None),
+    authorization: str | None = Header(None),
 ):
-    require_api_key(x_api_key)
+    require_upload_authorization(x_api_key, authorization)
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     ext = Path(file.filename).suffix or ".jpg"
     filename = f"{uuid.uuid4().hex}{ext}"
