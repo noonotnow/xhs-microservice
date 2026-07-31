@@ -4,5 +4,5 @@ xhs==0.2.13
 playwright==1.47.0
 python-multipart==0.0.9
 playwright-stealth
-xhshow
+xhshow @ git+https://github.com/Cloxl/xhshow.git@5f45309a06b2bb94131ccb51f158b0f2b2ff873a
 httpx

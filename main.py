@@ -1,7 +1,11 @@
+from __future__ import annotations
+
+import asyncio
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 import base64
 import binascii
 import hashlib
@@ -14,6 +18,7 @@ import uuid
 import shutil
 import traceback
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 import httpx
 from xhs import XhsClient
@@ -51,6 +56,26 @@ COOKIE_FILE = os.path.join(DATA_DIR, "cookie.json")
 QR_STATE_FILE = os.path.join(DATA_DIR, "qr_state.json")
 UPLOAD_TOKEN_MAX_LIFETIME_SECONDS = 5 * 60
 BASE64URL_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+TRUSTED_MEDIA_VIDEO_HOSTS = {
+    host.strip().lower()
+    for host in os.getenv(
+        "TRUSTED_MEDIA_VIDEO_HOSTS",
+        "images.xhs.justlikekatie.com",
+    ).split(",")
+    if host.strip()
+}
+MAX_REMOTE_VIDEO_BYTES = int(
+    os.getenv("MAX_REMOTE_VIDEO_BYTES", str(500 * 1024 * 1024))
+)
+REMOTE_VIDEO_DOWNLOAD_TIMEOUT_SECONDS = int(
+    os.getenv("REMOTE_VIDEO_DOWNLOAD_TIMEOUT_SECONDS", "300")
+)
+REMOTE_VIDEO_TIMEOUT = httpx.Timeout(
+    connect=10,
+    read=60,
+    write=10,
+    pool=10,
+)
 
 # --- Persistent client (singleton) ---
 client: XhsClient | None = None
@@ -263,7 +288,7 @@ def _get_image_dimensions(filepath: str) -> tuple[int, int]:
     return (1080, 1440)
 
 
-def _get_video_metadata(filepath: str) -> dict:
+def _get_video_metadata(filepath: str, strict: bool = False) -> dict:
     """Extract video metadata using ffprobe, with sensible fallback defaults."""
     import subprocess as _sp
     try:
@@ -277,6 +302,15 @@ def _get_video_metadata(filepath: str) -> dict:
             video_stream = next((s for s in probe.get('streams', []) if s.get('codec_type') == 'video'), {})
             audio_stream = next((s for s in probe.get('streams', []) if s.get('codec_type') == 'audio'), {})
             fmt = probe.get('format', {})
+            format_names = fmt.get("format_name", "").split(",")
+            if strict and (
+                not video_stream
+                or video_stream.get("codec_name") != "h264"
+                or not audio_stream
+                or audio_stream.get("codec_name") != "aac"
+                or not {"mov", "mp4"}.intersection(format_names)
+            ):
+                raise ValueError("File must be an H.264/AAC MP4 video")
 
             width = int(video_stream.get('width', 0))
             height = int(video_stream.get('height', 0))
@@ -299,8 +333,11 @@ def _get_video_metadata(filepath: str) -> dict:
                 "audio_channels": audio_channels,
                 "audio_sample_rate": audio_sample_rate,
             }
-    except Exception:
-        pass
+    except Exception as exc:
+        if strict:
+            raise ValueError("Could not read MP4 video metadata") from exc
+    if strict:
+        raise ValueError("Could not read MP4 video metadata")
     # Fallback defaults
     return {
         "width": 1080,
@@ -725,6 +762,150 @@ class VideoPublishRequest(BaseModel):
     is_private: bool = False
 
 
+class RemoteVideoPublishRequest(BaseModel):
+    video_url: str
+    title: str
+    caption: str
+    tags: list[str] = Field(default_factory=list)
+
+
+def _validate_media_video_url(video_url: str) -> None:
+    parsed = urlparse(video_url)
+    hostname = (parsed.hostname or "").lower()
+    decoded_path = unquote(parsed.path)
+    path_segments = decoded_path.split("/")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="video_url must be a trusted HTTPS MEDIA MP4 URL",
+        ) from exc
+
+    if (
+        parsed.scheme != "https"
+        or not hostname
+        or hostname not in TRUSTED_MEDIA_VIDEO_HOSTS
+        or parsed.username
+        or parsed.password
+        or port not in (None, 443)
+        or parsed.fragment
+        or any(segment in (".", "..") for segment in path_segments)
+        or not decoded_path.startswith("/videos/assets/")
+        or not decoded_path.lower().endswith(".mp4")
+        or decoded_path != parsed.path
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="video_url must be a trusted HTTPS MEDIA MP4 URL",
+        )
+
+
+async def _stage_remote_media_video(
+    video_url: str,
+    http_client: httpx.AsyncClient | None = None,
+) -> str:
+    _validate_media_video_url(video_url)
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    filepath = os.path.join(UPLOAD_DIR, f"{uuid.uuid4().hex}.mp4")
+    owns_client = http_client is None
+    client = http_client or httpx.AsyncClient(
+        timeout=REMOTE_VIDEO_TIMEOUT,
+        follow_redirects=False,
+    )
+
+    try:
+        async def download() -> None:
+            async with client.stream(
+                "GET",
+                video_url,
+                headers={"Accept": "video/mp4"},
+            ) as response:
+                if response.status_code != 200:
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"MEDIA video download returned HTTP {response.status_code}",
+                    )
+
+                content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
+                if content_type != "video/mp4":
+                    raise HTTPException(
+                        status_code=415,
+                        detail="MEDIA video must have Content-Type video/mp4",
+                    )
+
+                content_length = response.headers.get("content-length")
+                if content_length:
+                    try:
+                        declared_size = int(content_length)
+                    except ValueError as exc:
+                        raise HTTPException(
+                            status_code=502,
+                            detail="MEDIA video returned an invalid Content-Length",
+                        ) from exc
+                    if declared_size < 0:
+                        raise HTTPException(
+                            status_code=502,
+                            detail="MEDIA video returned an invalid Content-Length",
+                        )
+                    if declared_size > MAX_REMOTE_VIDEO_BYTES:
+                        raise HTTPException(
+                            status_code=413,
+                            detail="MEDIA video exceeds the maximum allowed size",
+                        )
+
+                total_size = 0
+                header = bytearray()
+                with open(filepath, "wb") as output:
+                    async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
+                        total_size += len(chunk)
+                        if total_size > MAX_REMOTE_VIDEO_BYTES:
+                            raise HTTPException(
+                                status_code=413,
+                                detail="MEDIA video exceeds the maximum allowed size",
+                            )
+                        if len(header) < 12:
+                            header.extend(chunk[:12 - len(header)])
+                        output.write(chunk)
+
+                if total_size < 12 or bytes(header[4:8]) != b"ftyp":
+                    raise HTTPException(
+                        status_code=415,
+                        detail="MEDIA video is not a valid MP4 file",
+                    )
+        try:
+            await asyncio.wait_for(
+                download(),
+                timeout=REMOTE_VIDEO_DOWNLOAD_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail="MEDIA video download timed out",
+            ) from exc
+        except httpx.TimeoutException as exc:
+            raise HTTPException(
+                status_code=504,
+                detail="MEDIA video download timed out",
+            ) from exc
+        except httpx.RequestError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="MEDIA video download failed",
+            ) from exc
+    except asyncio.CancelledError:
+        Path(filepath).unlink(missing_ok=True)
+        raise
+    except Exception:
+        Path(filepath).unlink(missing_ok=True)
+        raise
+    finally:
+        if owns_client:
+            await client.aclose()
+
+    return filepath
+
+
 @app.post("/publish-video")
 def publish_video(req: VideoPublishRequest, x_api_key: str | None = Header(None)):
     require_api_key(x_api_key)
@@ -891,6 +1072,72 @@ def publish_video(req: VideoPublishRequest, x_api_key: str | None = Header(None)
     except Exception as e:
         import traceback
         return {"status": "error", "detail": str(e), "traceback": traceback.format_exc()}
+
+
+@app.post("/publish-video-url")
+async def publish_video_url(
+    req: RemoteVideoPublishRequest,
+    x_api_key: str | None = Header(None),
+):
+    require_api_key(x_api_key)
+    if not req.title.strip() or len(req.title) > 20:
+        raise HTTPException(status_code=422, detail="title must be 1-20 characters")
+    if not req.caption.strip() or len(req.caption) > 1000:
+        raise HTTPException(status_code=422, detail="caption must be 1-1000 characters")
+    if len(req.tags) > 10 or any(not tag.strip() or len(tag) > 30 for tag in req.tags):
+        raise HTTPException(
+            status_code=422,
+            detail="tags must contain at most 10 non-empty values of 30 characters or fewer",
+        )
+
+    staged_video = await _stage_remote_media_video(req.video_url)
+    try:
+        try:
+            await run_in_threadpool(
+                _get_video_metadata,
+                staged_video,
+                True,
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=415,
+                detail="MEDIA video is not a readable MP4 video",
+            ) from exc
+
+        result = await run_in_threadpool(
+            publish_video,
+            VideoPublishRequest(
+                title=req.title.strip(),
+                desc=req.caption.strip(),
+                video_file=staged_video,
+                topic_keywords=[tag.strip() for tag in req.tags],
+            ),
+            x_api_key,
+        )
+    finally:
+        Path(staged_video).unlink(missing_ok=True)
+
+    if result.get("status") != "success":
+        raise HTTPException(
+            status_code=502,
+            detail=result.get("detail", "XHS video publish failed"),
+        )
+
+    note_id = result.get("note_id")
+    if not note_id:
+        raise HTTPException(
+            status_code=502,
+            detail="XHS publish response did not include a note ID",
+        )
+
+    share_url = result.get("share_link") or (
+        f"https://www.xiaohongshu.com/explore/{note_id}"
+    )
+    return {
+        "status": "success",
+        "note_id": note_id,
+        "share_url": share_url,
+    }
 
 
 # --- Health Check ---

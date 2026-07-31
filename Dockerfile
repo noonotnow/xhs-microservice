@@ -2,6 +2,7 @@ FROM python:3.12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
+    git \
     ca-certificates \
     fonts-liberation \
     libasound2 \
@@ -23,6 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpango-1.0-0 \
     libcairo2 \
     libglib2.0-0 \
+    ffmpeg \
     xvfb \
     && rm -rf /var/lib/apt/lists/*
 
