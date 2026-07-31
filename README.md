@@ -24,6 +24,8 @@ Real Xiaohongshu API
 | GET | `/session/status` | Check if current session is valid |
 | POST | `/upload` | Upload an image file (returns local path) |
 | POST | `/publish` | Publish or schedule a note |
+| POST | `/publish-video` | Publish a video already staged on this service |
+| POST | `/publish-video-url` | Stage and publish a trusted MEDIA video URL |
 
 All endpoints except `/health` require the permanent `X-Api-Key` header. For
 backward compatibility, `/upload` accepts that header or a short-lived
@@ -62,6 +64,46 @@ ahead. Use a separate high-entropy secret from `XHS_API_KEY`.
 
 1. `POST /upload` with image file → returns `{filepath}`
 2. `POST /publish` with title, desc, files (from step 1), optional post_time
+
+### Publishing a canonical MEDIA video
+
+`POST /publish-video-url` is the server-to-server contract for a manually
+confirmed publish from xhs-platform admin. It requires `X-Api-Key`; browser
+upload tokens are not accepted.
+
+```http
+POST /publish-video-url
+X-Api-Key: <XHS_API_KEY>
+Content-Type: application/json
+
+{
+  "video_url": "https://images.xhs.justlikekatie.com/videos/assets/example.mp4",
+  "title": "Post title",
+  "caption": "Caption prepared by CREATE",
+  "tags": ["topic-one", "topic-two"]
+}
+```
+
+The service accepts only HTTPS MP4 URLs under `/videos/assets/` on hosts in
+`TRUSTED_MEDIA_VIDEO_HOSTS` (default: `images.xhs.justlikekatie.com`). It does
+not follow redirects, requires `video/mp4`, verifies the MP4 signature, limits
+the download to `MAX_REMOTE_VIDEO_BYTES` (default: 500 MiB) and
+`REMOTE_VIDEO_DOWNLOAD_TIMEOUT_SECONDS` (default: 300 seconds), validates video
+metadata with `ffprobe`, and removes the staged file after the publish attempt.
+
+Success is returned only when XHS supplies a note ID:
+
+```json
+{
+  "status": "success",
+  "note_id": "xhs-note-id",
+  "share_url": "https://www.xiaohongshu.com/explore/xhs-note-id"
+}
+```
+
+Validation failures use 4xx responses. MEDIA retrieval, XHS publishing, or a
+missing note ID use explicit 5xx responses. Calling this endpoint publishes
+immediately, so the caller must place it behind explicit operator confirmation.
 
 ## Scheduling
 
