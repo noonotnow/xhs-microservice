@@ -16,6 +16,7 @@ import re
 import time
 import uuid
 import shutil
+import threading
 import traceback
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -54,6 +55,8 @@ DATA_DIR = os.getenv("DATA_DIR", "/app/data")
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/app/data/uploads")
 COOKIE_FILE = os.path.join(DATA_DIR, "cookie.json")
 QR_STATE_FILE = os.path.join(DATA_DIR, "qr_state.json")
+QR_LOGIN_LIFETIME_SECONDS = 2 * 60
+QR_STATE_LOCK = threading.Lock()
 UPLOAD_TOKEN_MAX_LIFETIME_SECONDS = 5 * 60
 BASE64URL_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 TRUSTED_MEDIA_VIDEO_HOSTS = {
@@ -239,15 +242,53 @@ def refresh_client():
     _patch_international_urls(client)
 
 
-def get_login_client() -> XhsClient:
+def get_login_client(cookie: str | None = None) -> XhsClient:
     """Create a client using xiaohongshu.com for QR login.
     QR login must go through xiaohongshu.com — the resulting cookies
     work cross-domain against rnote.com APIs."""
-    cookie = load_cookie()
     login_client = XhsClient(cookie=cookie, sign=sign)
     # Keep default xiaohongshu.com host for login
     # Do NOT set rnote.com hosts
     return login_client
+
+
+def _clear_qr_state() -> None:
+    global login_client
+    login_client = None
+    Path(QR_STATE_FILE).unlink(missing_ok=True)
+
+
+def _save_qr_state(state: dict) -> None:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    temp_path = f"{QR_STATE_FILE}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(temp_path, "w") as state_file:
+            json.dump(state, state_file)
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, QR_STATE_FILE)
+    finally:
+        Path(temp_path).unlink(missing_ok=True)
+
+
+def _load_qr_state() -> dict:
+    try:
+        with open(QR_STATE_FILE, "r") as state_file:
+            state = json.load(state_file)
+        if (
+            not isinstance(state, dict)
+            or not isinstance(state.get("qr_id"), str)
+            or not isinstance(state.get("code"), str)
+            or not isinstance(state.get("login_cookie"), str)
+            or type(state.get("expires_at")) is not int
+        ):
+            raise ValueError("Invalid QR state")
+        return state
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        _clear_qr_state()
+        raise HTTPException(
+            status_code=400,
+            detail="QR login state is invalid. Call /login/qr to start again.",
+        ) from exc
 
 
 def _get_image_dimensions(filepath: str) -> tuple[int, int]:
@@ -574,15 +615,32 @@ def _patch_international_urls(xhs_client):
 def get_qr(x_api_key: str | None = Header(None)):
     global login_client
     require_api_key(x_api_key)
-    login_client = get_login_client()
-    qr = login_client.get_qrcode()
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(QR_STATE_FILE, "w") as f:
-        json.dump({"qr_id": qr["qr_id"], "code": qr["code"]}, f)
+    with QR_STATE_LOCK:
+        _clear_qr_state()
+        try:
+            new_login_client = get_login_client()
+            qr = new_login_client.get_qrcode()
+            if not all(isinstance(qr.get(key), str) and qr[key] for key in ("qr_id", "code", "url")):
+                raise ValueError("XHS returned incomplete QR data")
+            login_client = new_login_client
+            expires_at = int(time.time()) + QR_LOGIN_LIFETIME_SECONDS
+            _save_qr_state({
+                "qr_id": qr["qr_id"],
+                "code": qr["code"],
+                "login_cookie": login_client.cookie,
+                "expires_at": expires_at,
+            })
+        except Exception as exc:
+            _clear_qr_state()
+            raise HTTPException(
+                status_code=502,
+                detail="Could not generate XHS QR code",
+            ) from exc
     return {
         "qr_id": qr["qr_id"],
         "code": qr["code"],
         "url": qr["url"],
+        "expires_at": expires_at,
     }
 
 
@@ -590,24 +648,42 @@ def get_qr(x_api_key: str | None = Header(None)):
 def check_login_status(x_api_key: str | None = Header(None)):
     global login_client
     require_api_key(x_api_key)
-    if not os.path.exists(QR_STATE_FILE):
-        raise HTTPException(status_code=400, detail="No QR login in progress. Call /login/qr first.")
-    with open(QR_STATE_FILE, "r") as f:
-        qr_state = json.load(f)
-    if login_client is None:
-        login_client = get_login_client()
-    status = login_client.check_qrcode(qr_state["qr_id"], qr_state["code"])
-    if status.get("code_status") == 2:
-        # Save cookies from xiaohongshu.com login
-        save_cookie(login_client.cookie)
-        # Rebuild the main client with rnote.com hosts + fresh cookies
-        refresh_client()
-        login_client = None  # Clean up
-        os.remove(QR_STATE_FILE)
-    return {
-        "code_status": status.get("code_status"),
-        "login_info": status.get("login_info"),
-    }
+    with QR_STATE_LOCK:
+        if not os.path.exists(QR_STATE_FILE):
+            raise HTTPException(status_code=400, detail="No QR login in progress. Call /login/qr first.")
+        qr_state = _load_qr_state()
+        if qr_state["expires_at"] <= int(time.time()):
+            _clear_qr_state()
+            return {
+                "code_status": -1,
+                "login_info": None,
+                "expired": True,
+            }
+        if login_client is None:
+            login_client = get_login_client(qr_state["login_cookie"])
+        status = login_client.check_qrcode(qr_state["qr_id"], qr_state["code"])
+        code_status = status.get("code_status")
+        if code_status == 2:
+            # Save cookies from xiaohongshu.com login
+            save_cookie(login_client.cookie)
+            # Rebuild the main client with rnote.com hosts + fresh cookies
+            refresh_client()
+            _clear_qr_state()
+        elif code_status not in (0, 1):
+            _clear_qr_state()
+            return {
+                "code_status": code_status,
+                "login_info": status.get("login_info"),
+                "expired": True,
+            }
+        else:
+            qr_state["login_cookie"] = login_client.cookie
+            _save_qr_state(qr_state)
+        return {
+            "code_status": code_status,
+            "login_info": status.get("login_info"),
+            "expired": False,
+        }
 
 
 # --- Manual Cookie Login ---
