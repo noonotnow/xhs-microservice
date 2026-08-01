@@ -84,7 +84,7 @@ QR_NO_STORE_HEADERS = {
 }
 CLIENT_LOCK = threading.Lock()
 REDNOTE_CREATOR_HOST = "https://creator.rednote.com"
-REDNOTE_CREATOR_VALIDATION_PATH = "/api/media/v1/upload/web/permit"
+REDNOTE_CREATOR_VALIDATION_PATH = "/api/media/v1/upload/creator/permit"
 REDNOTE_CREATOR_VALIDATION_URI = (
     f"{REDNOTE_CREATOR_VALIDATION_PATH}"
     "?biz_name=spectrum&scene=image&file_count=1&version=1&source=web"
@@ -1588,8 +1588,7 @@ def debug_creator_direct(x_api_key: str | None = Header(None)):
     return {
         "status_code": resp.status_code,
         "elapsed_seconds": elapsed,
-        "response": resp.json() if resp.headers.get("content-type", "").startswith("application/json") else resp.text[:200],
-        "x_s_used": sign_result["x-s"][:30] + "...",
+        "ok": 200 <= resp.status_code < 300,
     }
 
 
@@ -1633,19 +1632,26 @@ def debug_publish_steps(x_api_key: str | None = Header(None)):
         uri = "/api/media/v1/upload/web/permit"
         params = {"biz_name": "spectrum", "scene": "image", "file_count": 1, "version": "1", "source": "web"}
         res = xhs.get(uri, params, is_creator=True)
-        temp_permit = res["uploadTempPermits"][0]
-        results["2_upload_permit"] = {"ok": True, "file_id": temp_permit["fileIds"][0]}
-    except Exception as e:
-        results["2_upload_permit"] = {"ok": False, "error": str(e)}
+        results["2_upload_permit"] = {
+            "ok": bool(res.get("uploadTempPermits"))
+            if isinstance(res, dict)
+            else False
+        }
+    except Exception:
+        results["2_upload_permit"] = {"ok": False}
 
     # Step 2b: creator upload permit (the exact URL from Katie's browser)
     try:
         uri = "/api/media/v1/upload/creator/permit"
         params = {"biz_name": "spectrum", "scene": "image", "file_count": 1, "version": "1", "source": "web"}
         res = xhs.get(uri, params, is_creator=True)
-        results["2b_creator_upload_permit"] = {"ok": True, "data": str(res)[:200]}
-    except Exception as e:
-        results["2b_creator_upload_permit"] = {"ok": False, "error": str(e)}
+        results["2b_creator_upload_permit"] = {
+            "ok": bool(res.get("uploadTempPermits"))
+            if isinstance(res, dict)
+            else False
+        }
+    except Exception:
+        results["2b_creator_upload_permit"] = {"ok": False}
 
     # Step 3: get_suggest_topic
     try:

@@ -94,10 +94,10 @@ replace submitted cookie names. Both `a1` and `web_session` are required.
 Cookie values and names are never logged or returned.
 
 A submitted cookie is validated through the signed Creator upload-permit GET
-already used by publishing:
+confirmed by the authenticated browser flow:
 
 ```text
-https://creator.rednote.com/api/media/v1/upload/web/permit?biz_name=spectrum&scene=image&file_count=1&version=1&source=web
+https://creator.rednote.com/api/media/v1/upload/creator/permit?biz_name=spectrum&scene=image&file_count=1&version=1&source=web
 ```
 
 The request includes request-local signing plus browser-compatible Origin,
@@ -130,7 +130,7 @@ stable sanitized metadata without forwarding the permit payload:
   "validation": {
     "method": "creator_upload_permit",
     "host": "creator.rednote.com",
-    "path": "/api/media/v1/upload/web/permit",
+    "path": "/api/media/v1/upload/creator/permit",
     "source": "active_session"
   },
   "relogin_required": false

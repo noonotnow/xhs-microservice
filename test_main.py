@@ -145,6 +145,64 @@ class CookieLoginRouteTests(unittest.TestCase):
             candidate,
         )
 
+    def test_nested_creator_permit_response_returns_only_sanitized_status(self):
+        candidate = object()
+        permit_token = "synthetic-placeholder-token"
+        permit_file_id = "synthetic-placeholder-file-id"
+        upstream_response = types.SimpleNamespace(
+            is_redirect=False,
+            is_permanent_redirect=False,
+            status_code=200,
+            json=lambda: {
+                "success": True,
+                "code": 0,
+                "data": {
+                    "result": {"success": True},
+                    "uploadTempPermits": [
+                        {
+                            "token": permit_token,
+                            "fileIds": [permit_file_id],
+                        }
+                    ],
+                },
+            },
+        )
+        with (
+            patch.object(
+                main,
+                "_new_creator_client",
+                return_value=candidate,
+            ),
+            patch.object(
+                main,
+                "_request_creator_validation",
+                return_value=upstream_response,
+            ),
+            patch.object(main, "_save_and_swap_client") as save_and_swap,
+            patch.object(main.logger, "info") as log_info,
+            patch.object(main.logger, "warning") as log_warning,
+        ):
+            response = self.client.post(
+                "/login/cookie",
+                headers=self.headers,
+                json={"cookie": "a1=synthetic; web_session=synthetic"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["valid"])
+        self.assertEqual(
+            response.json()["validation"]["source"],
+            "cookie_login_candidate",
+        )
+        save_and_swap.assert_called_once_with(
+            "a1=synthetic; web_session=synthetic",
+            candidate,
+        )
+        log_info.assert_not_called()
+        log_warning.assert_not_called()
+        for permit_value in (permit_token, permit_file_id):
+            self.assertNotIn(permit_value, response.text)
+
     def test_rejects_devtools_table_export_without_echoing_input(self):
         response = self.client.post(
             "/login/cookie",
@@ -619,15 +677,22 @@ class CreatorSessionValidationTests(unittest.TestCase):
             )
 
         self.assertEqual(validation, main.CreatorSessionValidation(valid=True))
+        expected_path = "/api/media/v1/upload/creator/permit"
+        expected_uri = (
+            f"{expected_path}"
+            "?biz_name=spectrum&scene=image&file_count=1&version=1&source=web"
+        )
+        self.assertEqual(main.REDNOTE_CREATOR_VALIDATION_PATH, expected_path)
+        self.assertEqual(main.REDNOTE_CREATOR_VALIDATION_URI, expected_uri)
         creator_sign.assert_called_once_with(
-            main.REDNOTE_CREATOR_VALIDATION_URI,
+            expected_uri,
             None,
             a1="signing-cookie",
         )
         request, request_kwargs = adapter.requests[0]
         self.assertEqual(
             request.url,
-            f"{main.REDNOTE_CREATOR_HOST}{main.REDNOTE_CREATOR_VALIDATION_URI}",
+            f"https://creator.rednote.com{expected_uri}",
         )
         self.assertEqual(request.method, "GET")
         self.assertEqual(request.headers["Cookie"], cookie_header)
