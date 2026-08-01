@@ -1629,11 +1629,6 @@ def debug_publish_steps(x_api_key: str | None = Header(None)):
     except Exception as e:
         results["1b_creator_self_info"] = {"ok": False, "error": str(e)}
 
-    # XhsClient.request prints decoded responses in the pinned dependency.
-    # Permit probes stay disabled so credentials cannot reach process stdout.
-    results["2_upload_permit"] = {"ok": False, "disabled": True}
-    results["2b_creator_upload_permit"] = {"ok": False, "disabled": True}
-
     # Step 3: get_suggest_topic
     try:
         topics = xhs.get_suggest_topic("test")

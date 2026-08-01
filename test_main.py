@@ -165,14 +165,8 @@ class DebugPermitProbeSecurityTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(
-            response.json()["2_upload_permit"],
-            {"ok": False, "disabled": True},
-        )
-        self.assertEqual(
-            response.json()["2b_creator_upload_permit"],
-            {"ok": False, "disabled": True},
-        )
+        self.assertNotIn("2_upload_permit", response.json())
+        self.assertNotIn("2b_creator_upload_permit", response.json())
         self.assertFalse(
             any("permit" in uri for uri in fake_client.get_calls)
         )
