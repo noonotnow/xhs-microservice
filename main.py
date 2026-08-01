@@ -24,6 +24,7 @@ from urllib.parse import unquote, urlencode, urlparse
 
 import httpx
 from xhs import XhsClient
+from xhs.help import get_a1_and_web_id
 from xhshow import Xhshow
 from sign_service import sign
 
@@ -41,6 +42,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def prevent_qr_response_caching(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path in {"/login/qr", "/login/status"}:
+        response.headers["Cache-Control"] = (
+            "no-store, no-cache, max-age=0, must-revalidate"
+        )
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
 
 
 @app.exception_handler(Exception)
@@ -65,7 +78,11 @@ UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/app/data/uploads")
 COOKIE_FILE = os.path.join(DATA_DIR, "cookie.json")
 QR_STATE_FILE = os.path.join(DATA_DIR, "qr_state.json")
 QR_LOGIN_LIFETIME_SECONDS = 2 * 60
+QR_EXPIRY_SAFETY_SECONDS = 5
+QR_CREATION_ATTEMPTS = 2
+QR_REJECTED_ID_LIFETIME_SECONDS = 5 * 60
 QR_STATE_LOCK = threading.Lock()
+RECENT_REJECTED_QR_IDS: dict[str, int] = {}
 XHS_CUSTOMER_HOST = "https://customer.xiaohongshu.com"
 XHS_CREATOR_LOGIN_HOST = "https://creator.xiaohongshu.com"
 UPLOAD_TOKEN_MAX_LIFETIME_SECONDS = 5 * 60
@@ -257,7 +274,24 @@ def get_login_client(cookie: str | None = None) -> XhsClient:
     """Create a client using xiaohongshu.com for QR login.
     QR login must go through xiaohongshu.com — the resulting cookies
     work cross-domain against rnote.com APIs."""
-    login_client = XhsClient(cookie=cookie, sign=sign)
+    login_client = XhsClient(sign=sign)
+    login_client.session.cookies.clear()
+    if cookie:
+        cookie_dict = {}
+        for block in cookie.split(";"):
+            if not block.strip() or "=" not in block:
+                continue
+            name, value = block.split("=", 1)
+            cookie_dict[name.strip()] = value.strip()
+        if not cookie_dict:
+            raise ValueError("Persisted QR cookie is invalid")
+        login_client.session.cookies.update(cookie_dict)
+    else:
+        a1, web_id = get_a1_and_web_id()
+        login_client.session.cookies.update({
+            "a1": a1,
+            "webId": web_id,
+        })
     # Keep default xiaohongshu.com host for login
     # Do NOT set rnote.com hosts
     return login_client
@@ -291,6 +325,8 @@ def _login_request(
     headers = {
         **signed_headers,
         "Content-Type": "application/json",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
     }
     if referer:
         headers["Referer"] = referer
@@ -330,6 +366,57 @@ def _create_creator_qr(xhs_client: XhsClient) -> dict:
         XHS_CUSTOMER_HOST,
         "/api/cas/customer/web/qr-code",
         data={"service": XHS_CREATOR_LOGIN_HOST},
+    )
+
+
+def _creator_qr_expires_at(qr: dict, now: int) -> int:
+    timestamp_fields = (
+        "expires_at",
+        "expire_at",
+        "expire_time",
+        "expiration_time",
+    )
+    duration_fields = ("expires_in", "ttl", "expire")
+    duration_ms_fields = ("expires_in_ms", "ttl_ms", "expire_ms")
+
+    for field in timestamp_fields + duration_fields + duration_ms_fields:
+        raw_value = qr.get(field)
+        if isinstance(raw_value, str) and raw_value.isdigit():
+            raw_value = int(raw_value)
+        if type(raw_value) not in (int, float) or raw_value <= 0:
+            continue
+
+        if field in duration_fields:
+            upstream_expiry = now + int(raw_value)
+        elif field in duration_ms_fields:
+            upstream_expiry = now + int(raw_value / 1000)
+        elif raw_value > 10_000_000_000:
+            upstream_expiry = int(raw_value / 1000)
+        elif raw_value > 1_000_000_000:
+            upstream_expiry = int(raw_value)
+        else:
+            duration = raw_value / 1000 if raw_value > 10_000 else raw_value
+            upstream_expiry = now + int(duration)
+
+        return upstream_expiry - QR_EXPIRY_SAFETY_SECONDS
+
+    return now + QR_LOGIN_LIFETIME_SECONDS
+
+
+def _recent_rejected_qr_ids(now: int) -> set[str]:
+    expired_ids = [
+        qr_id
+        for qr_id, rejected_until in RECENT_REJECTED_QR_IDS.items()
+        if rejected_until <= now
+    ]
+    for qr_id in expired_ids:
+        del RECENT_REJECTED_QR_IDS[qr_id]
+    return set(RECENT_REJECTED_QR_IDS)
+
+
+def _remember_rejected_qr_id(qr_id: str, now: int) -> None:
+    RECENT_REJECTED_QR_IDS[qr_id] = (
+        now + QR_REJECTED_ID_LIFETIME_SECONDS
     )
 
 
@@ -732,14 +819,48 @@ def get_qr(x_api_key: str | None = Header(None)):
     global login_client
     require_api_key(x_api_key)
     with QR_STATE_LOCK:
+        previous_qr_id = None
+        if os.path.exists(QR_STATE_FILE):
+            try:
+                with open(QR_STATE_FILE, "r") as state_file:
+                    previous_state = json.load(state_file)
+                if isinstance(previous_state, dict):
+                    previous_qr_id = previous_state.get("qr_id")
+            except (OSError, json.JSONDecodeError):
+                pass
         _clear_qr_state()
         try:
-            new_login_client = get_login_client()
-            qr = _create_creator_qr(new_login_client)
-            if not all(isinstance(qr.get(key), str) and qr[key] for key in ("id", "url")):
-                raise ValueError("XHS returned incomplete QR data")
+            now = int(time.time())
+            rejected_qr_ids = _recent_rejected_qr_ids(now)
+            if isinstance(previous_qr_id, str):
+                rejected_qr_ids.add(previous_qr_id)
+                _remember_rejected_qr_id(previous_qr_id, now)
+            qr = None
+            new_login_client = None
+            expires_at = 0
+            for _ in range(QR_CREATION_ATTEMPTS):
+                candidate_client = get_login_client()
+                candidate_qr = _create_creator_qr(candidate_client)
+                if not all(
+                    isinstance(candidate_qr.get(key), str) and candidate_qr[key]
+                    for key in ("id", "url")
+                ):
+                    raise ValueError("XHS returned incomplete QR data")
+                now = int(time.time())
+                candidate_expiry = _creator_qr_expires_at(candidate_qr, now)
+                if (
+                    candidate_qr["id"] not in rejected_qr_ids
+                    and candidate_expiry > now
+                ):
+                    qr = candidate_qr
+                    new_login_client = candidate_client
+                    expires_at = candidate_expiry
+                    break
+                rejected_qr_ids.add(candidate_qr["id"])
+                _remember_rejected_qr_id(candidate_qr["id"], now)
+            if qr is None or new_login_client is None:
+                raise ValueError("XHS returned a stale or expired QR code")
             login_client = new_login_client
-            expires_at = int(time.time()) + QR_LOGIN_LIFETIME_SECONDS
             _save_qr_state({
                 "flow": "creator",
                 "qr_id": qr["id"],

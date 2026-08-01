@@ -39,11 +39,13 @@ class QRLoginRouteTests(unittest.TestCase):
         self.data_dir_patch.start()
         self.qr_file_patch.start()
         main.login_client = None
+        main.RECENT_REJECTED_QR_IDS.clear()
         self.client = TestClient(main.app)
         self.headers = {"X-Api-Key": main.API_KEY}
 
     def tearDown(self):
         main.login_client = None
+        main.RECENT_REJECTED_QR_IDS.clear()
         self.qr_file_patch.stop()
         self.data_dir_patch.stop()
         self.temp_dir.cleanup()
@@ -53,6 +55,7 @@ class QRLoginRouteTests(unittest.TestCase):
             response = self.client.get("/login/qr")
 
         self.assertEqual(response.status_code, 403)
+        self.assertIn("no-store", response.headers["cache-control"])
         get_login_client.assert_not_called()
 
     def test_qr_generation_replaces_stale_state_with_resumable_state(self):
@@ -82,6 +85,154 @@ class QRLoginRouteTests(unittest.TestCase):
         self.assertEqual(state["flow"], "creator")
         self.assertEqual(state["login_cookie"], fake_client.cookie)
         self.assertGreater(state["expires_at"], int(time.time()))
+        self.assertIn("no-store", response.headers["cache-control"])
+
+    def test_qr_generation_retries_reused_qr_id(self):
+        main._save_qr_state({
+            "flow": "creator",
+            "qr_id": "old-id",
+            "login_cookie": "old-cookie",
+            "expires_at": int(time.time()) + 60,
+        })
+        first_client = FakeLoginClient("first-cookie")
+        second_client = FakeLoginClient("second-cookie")
+
+        with (
+            patch.object(
+                main,
+                "get_login_client",
+                side_effect=[first_client, second_client],
+            ) as get_login_client,
+            patch.object(
+                main,
+                "_create_creator_qr",
+                side_effect=[
+                    {"id": "old-id", "url": "xhsdiscover://old"},
+                    {"id": "new-id", "url": "xhsdiscover://new"},
+                ],
+            ),
+        ):
+            response = self.client.get("/login/qr", headers=self.headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["qr_id"], "new-id")
+        self.assertEqual(response.json()["url"], "xhsdiscover://new")
+        self.assertEqual(get_login_client.call_count, 2)
+        state = json.loads(Path(main.QR_STATE_FILE).read_text())
+        self.assertEqual(state["qr_id"], "new-id")
+        self.assertEqual(state["login_cookie"], "second-cookie")
+
+    def test_qr_generation_retries_immediately_expired_upstream_qr(self):
+        first_client = FakeLoginClient("first-cookie")
+        second_client = FakeLoginClient("second-cookie")
+        now = 2_000_000_000
+        upstream_expiry_ms = (now + 120) * 1000
+
+        with (
+            patch.object(main.time, "time", return_value=now),
+            patch.object(
+                main,
+                "get_login_client",
+                side_effect=[first_client, second_client],
+            ),
+            patch.object(
+                main,
+                "_create_creator_qr",
+                side_effect=[
+                    {
+                        "id": "expired-id",
+                        "url": "xhsdiscover://expired",
+                        "expires_at": now - 1,
+                    },
+                    {
+                        "id": "fresh-id",
+                        "url": "xhsdiscover://fresh",
+                        "expires_at": upstream_expiry_ms,
+                    },
+                ],
+            ),
+        ):
+            response = self.client.get("/login/qr", headers=self.headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["qr_id"], "fresh-id")
+        self.assertEqual(
+            response.json()["expires_at"],
+            now + 120 - main.QR_EXPIRY_SAFETY_SECONDS,
+        )
+
+    def test_qr_generation_fails_when_upstream_only_returns_stale_qrs(self):
+        now = 2_000_000_000
+        with (
+            patch.object(main.time, "time", return_value=now),
+            patch.object(main, "get_login_client", return_value=FakeLoginClient()),
+            patch.object(
+                main,
+                "_create_creator_qr",
+                side_effect=[
+                    {
+                        "id": "expired-id",
+                        "url": "xhsdiscover://expired",
+                        "expires_at": now - 1,
+                    },
+                    {
+                        "id": "expired-id",
+                        "url": "xhsdiscover://same-id-without-expiry",
+                    },
+                ],
+            ),
+        ):
+            response = self.client.get("/login/qr", headers=self.headers)
+
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(
+            response.json(),
+            {"detail": "Could not generate XHS QR code"},
+        )
+        self.assertFalse(os.path.exists(main.QR_STATE_FILE))
+        self.assertIn("no-store", response.headers["cache-control"])
+
+    def test_qr_generation_rejects_expired_id_on_later_start(self):
+        now = 2_000_000_000
+        with (
+            patch.object(main.time, "time", return_value=now),
+            patch.object(main, "get_login_client", return_value=FakeLoginClient()),
+            patch.object(
+                main,
+                "_create_creator_qr",
+                side_effect=[
+                    {
+                        "id": "expired-id",
+                        "url": "xhsdiscover://expired",
+                        "expires_at": now - 1,
+                    },
+                    {
+                        "id": "expired-id",
+                        "url": "xhsdiscover://same-id",
+                    },
+                    {
+                        "id": "expired-id",
+                        "url": "xhsdiscover://same-id-again",
+                    },
+                    {
+                        "id": "fresh-id",
+                        "url": "xhsdiscover://fresh",
+                    },
+                ],
+            ),
+        ):
+            first_response = self.client.get(
+                "/login/qr",
+                headers=self.headers,
+            )
+            second_response = self.client.get(
+                "/login/qr",
+                headers=self.headers,
+            )
+
+        self.assertEqual(first_response.status_code, 502)
+        self.assertEqual(second_response.status_code, 200)
+        self.assertEqual(second_response.json()["qr_id"], "fresh-id")
 
     def test_qr_generation_failure_clears_stale_state(self):
         Path(main.QR_STATE_FILE).write_text('{"stale": true}')
@@ -119,6 +270,7 @@ class QRLoginRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["expired"], True)
         self.assertFalse(os.path.exists(main.QR_STATE_FILE))
+        self.assertIn("no-store", response.headers["cache-control"])
 
     def test_polling_resumes_from_persisted_login_cookie(self):
         main._save_qr_state({
@@ -216,6 +368,54 @@ class QRLoginRouteTests(unittest.TestCase):
 
 
 class CreatorQRProtocolTests(unittest.TestCase):
+    def test_new_login_client_replaces_pinned_static_identity(self):
+        fake_client = types.SimpleNamespace(
+            session=types.SimpleNamespace(
+                cookies=types.SimpleNamespace(
+                    clear=unittest.mock.Mock(),
+                    update=unittest.mock.Mock(),
+                )
+            )
+        )
+        with (
+            patch.object(main, "XhsClient", return_value=fake_client),
+            patch.object(
+                main,
+                "get_a1_and_web_id",
+                return_value=("fresh-a1", "fresh-web-id"),
+            ),
+        ):
+            result = main.get_login_client()
+
+        self.assertIs(result, fake_client)
+        fake_client.session.cookies.clear.assert_called_once_with()
+        fake_client.session.cookies.update.assert_called_once_with({
+            "a1": "fresh-a1",
+            "webId": "fresh-web-id",
+        })
+
+    def test_resumed_login_client_restores_only_persisted_cookies(self):
+        fake_client = types.SimpleNamespace(
+            session=types.SimpleNamespace(
+                cookies=types.SimpleNamespace(
+                    clear=unittest.mock.Mock(),
+                    update=unittest.mock.Mock(),
+                )
+            )
+        )
+        with patch.object(main, "XhsClient", return_value=fake_client):
+            result = main.get_login_client(
+                "a1=fresh-a1; webId=fresh-id; acw_tc=padded=="
+            )
+
+        self.assertIs(result, fake_client)
+        fake_client.session.cookies.clear.assert_called_once_with()
+        fake_client.session.cookies.update.assert_called_once_with({
+            "a1": "fresh-a1",
+            "webId": "fresh-id",
+            "acw_tc": "padded==",
+        })
+
     def test_health_reports_deployed_revision(self):
         with patch.object(main, "APP_REVISION", "commit-sha"):
             response = TestClient(main.app).get("/health")

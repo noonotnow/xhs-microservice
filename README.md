@@ -73,6 +73,15 @@ resume after a container restart, is stored in `qr_state.json`. Expired or
 rejected QR attempts return `expired: true` and are removed so the next
 `/login/qr` call starts cleanly.
 
+Every `/login/qr` request replaces prior state and generates a new anonymous
+browser identity, avoiding the hard-coded cookies in `xhs==0.2.13`. Reused or
+already-expired CAS QR IDs are retried once and never persisted. When CAS
+provides expiration metadata, the service honors second or millisecond
+timestamps, second durations, or explicitly millisecond-suffixed durations
+with a safety margin; otherwise it uses the two-minute fallback. Rejected IDs
+remain blocked for five minutes. QR and status responses always include
+`Cache-Control: no-store`.
+
 If XHS rejects the Creator CAS flow, the endpoint returns a sanitized 502
 without cookies, tickets, or tracebacks. Use the existing authenticated
 `POST /login/cookie` operation as the manual fallback; no Railway environment
