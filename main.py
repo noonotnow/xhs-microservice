@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictStr
 from starlette.concurrency import run_in_threadpool
 import base64
 import binascii
@@ -108,6 +110,12 @@ COOKIE_HEADER_ERROR_MESSAGES = {
     "cookie_header_invalid_name": (
         "Cookie request header contains an invalid field name."
     ),
+    "cookie_header_invalid_value": (
+        "Cookie request header contains an unsupported field value."
+    ),
+    "cookie_header_invalid_type": (
+        "Cookie request body must contain one string field."
+    ),
     "cookie_header_duplicate_name": (
         "Cookie request header contains an ambiguous duplicate field."
     ),
@@ -122,6 +130,27 @@ COOKIE_HEADER_ERROR_MESSAGES = {
         "Cookie request header is missing required non-empty session fields."
     ),
 }
+
+
+@app.exception_handler(RequestValidationError)
+async def sanitized_cookie_request_validation_handler(
+    request: Request,
+    exc: RequestValidationError,
+):
+    if request.url.path == "/login/cookie":
+        code = "cookie_header_invalid_type"
+        return JSONResponse(
+            status_code=400,
+            content={
+                "detail": {
+                    "code": code,
+                    "message": COOKIE_HEADER_ERROR_MESSAGES[code],
+                }
+            },
+        )
+    return await request_validation_exception_handler(request, exc)
+
+
 TRUSTED_MEDIA_VIDEO_HOSTS = {
     host.strip().lower()
     for host in os.getenv(
@@ -296,6 +325,10 @@ def _parse_cookie_header(cookie_header: str) -> dict[str, str]:
         value = value.strip(" ")
         if not COOKIE_NAME_RE.fullmatch(name):
             raise _cookie_header_error("cookie_header_invalid_name")
+        try:
+            value.encode("latin-1")
+        except UnicodeEncodeError as exc:
+            raise _cookie_header_error("cookie_header_invalid_value") from exc
         if name in cookies:
             raise _cookie_header_error("cookie_header_duplicate_name")
         cookies[name] = value
@@ -739,7 +772,7 @@ def check_login_status(x_api_key: str | None = Header(None)):
 
 # --- Manual Cookie Login ---
 class CookieLoginRequest(BaseModel):
-    cookie: str
+    cookie: StrictStr
 
 
 @dataclass(frozen=True)

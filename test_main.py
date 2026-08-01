@@ -198,10 +198,18 @@ class CookieLoginRouteTests(unittest.TestCase):
         submitted_cookie,
         expected_code,
         canaries=(),
+        request_kwargs=None,
     ):
         working_client = object()
         main.client = working_client
         stdout = io.StringIO()
+        if request_kwargs is None:
+            request_kwargs = {"json": {"cookie": submitted_cookie}}
+        request_kwargs = dict(request_kwargs)
+        request_headers = {
+            **self.headers,
+            **request_kwargs.pop("headers", {}),
+        }
         with (
             patch.object(main, "_new_creator_client") as new_client,
             patch.object(main, "creator_sign") as creator_sign,
@@ -215,8 +223,8 @@ class CookieLoginRouteTests(unittest.TestCase):
         ):
             response = self.client.post(
                 "/login/cookie",
-                headers=self.headers,
-                json={"cookie": submitted_cookie},
+                headers=request_headers,
+                **request_kwargs,
             )
 
         self.assertEqual(response.status_code, 400)
@@ -284,11 +292,15 @@ class CookieLoginRouteTests(unittest.TestCase):
     def test_accepts_optional_cookie_label_outer_spaces_and_trailing_newline(self):
         normalized = "a1=synthetic; web_session=synthetic"
         submissions = (
-            normalized,
-            f"  cOoKiE:  {normalized}  \r\n  ",
-            f"COOKIE: {normalized}\n",
+            (normalized, normalized),
+            (f"  cOoKiE:  {normalized}  \r\n  ", normalized),
+            (f"COOKIE: {normalized}\n", normalized),
+            (
+                "a1=latin-1-\u00e9; web_session=synthetic",
+                "a1=latin-1-\u00e9; web_session=synthetic",
+            ),
         )
-        for submitted in submissions:
+        for submitted, expected in submissions:
             candidate = object()
             with (
                 self.subTest(submitted=submitted),
@@ -311,9 +323,9 @@ class CookieLoginRouteTests(unittest.TestCase):
                 )
 
             self.assertEqual(response.status_code, 200)
-            new_client.assert_called_once_with(normalized)
-            validate.assert_called_once_with(candidate, normalized)
-            save_and_swap.assert_called_once_with(normalized, candidate)
+            new_client.assert_called_once_with(expected)
+            validate.assert_called_once_with(candidate, expected)
+            save_and_swap.assert_called_once_with(expected, candidate)
 
     def test_nested_creator_permit_response_returns_only_sanitized_status(self):
         candidate = object()
@@ -430,6 +442,12 @@ class CookieLoginRouteTests(unittest.TestCase):
                 ("name-canary",),
             ),
             (
+                "non-Latin-1 value",
+                "a1=unicode-canary-\U0001f512; web_session=synthetic",
+                "cookie_header_invalid_value",
+                ("unicode-canary", "\U0001f512"),
+            ),
+            (
                 "missing equals",
                 "pair-canary; a1=synthetic; web_session=synthetic",
                 "cookie_header_missing_equals",
@@ -480,6 +498,56 @@ class CookieLoginRouteTests(unittest.TestCase):
 
         self.assertNotIn("a1", response.text)
         self.assertNotIn("web_session", response.text)
+
+    def test_sanitizes_invalid_cookie_request_shapes_without_reflection(self):
+        cases = (
+            (
+                "missing field",
+                {"json": {"other": "missing-canary"}},
+                ("missing-canary",),
+            ),
+            (
+                "object field",
+                {"json": {"cookie": {"raw": "object-canary"}}},
+                ("object-canary",),
+            ),
+            (
+                "array field",
+                {"json": {"cookie": ["array-canary"]}},
+                ("array-canary",),
+            ),
+            (
+                "numeric field",
+                {"json": {"cookie": 12345}},
+                (),
+            ),
+            (
+                "malformed JSON",
+                {
+                    "content": '{"cookie":"malformed-canary"',
+                    "headers": {"Content-Type": "application/json"},
+                },
+                ("malformed-canary",),
+            ),
+        )
+        for name, request_kwargs, canaries in cases:
+            with self.subTest(name=name):
+                self.assert_cookie_parse_failure(
+                    None,
+                    "cookie_header_invalid_type",
+                    canaries,
+                    request_kwargs=request_kwargs,
+                )
+
+    def test_unrelated_request_validation_keeps_default_422_contract(self):
+        response = self.client.post(
+            "/publish",
+            headers=self.headers,
+            json={"title": {"synthetic": "value"}},
+        )
+
+        self.assertEqual(response.status_code, 422)
+        self.assertIsInstance(response.json()["detail"], list)
 
     def test_cookie_login_requires_api_key_before_parsing(self):
         response = self.client.post(
