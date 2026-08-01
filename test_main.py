@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from contextlib import redirect_stdout
@@ -189,9 +190,11 @@ class CookieLoginRouteTests(unittest.TestCase):
         self.client = TestClient(main.app)
         self.headers = {"X-Api-Key": main.API_KEY}
         self.original_client = main.client
+        self.original_active_cookie = main.active_cookie
 
     def tearDown(self):
         main.client = self.original_client
+        main.active_cookie = self.original_active_cookie
 
     def test_accepts_only_creator_valid_cookie_and_preserves_equals_in_value(self):
         candidate = object()
@@ -596,9 +599,12 @@ class CookieLoginRouteTests(unittest.TestCase):
         with (
             patch.object(
                 main,
-                "get_client",
-                return_value=types.SimpleNamespace(
-                    cookie="a1=current; web_session=current"
+                "get_active_client_and_cookie",
+                return_value=(
+                    types.SimpleNamespace(
+                        cookie="a1=current; web_session=current"
+                    ),
+                    "a1=current; web_session=current",
                 ),
             ),
             patch.object(
@@ -628,9 +634,13 @@ class CookieLoginRouteTests(unittest.TestCase):
         self.assertNotIn(upstream_error, response.text)
 
     def test_cookie_login_and_status_share_creator_validation_contract(self):
+        # `.cookie` deliberately differs from the canonical persisted header
+        # to prove /session/status validates the canonical cookie, not a
+        # cookie-jar re-serialization of the active client.
         candidate = types.SimpleNamespace(
-            cookie="a1=fresh; web_session=fresh"
+            cookie="a1=fresh; web_session=fresh; jar_added=mutated"
         )
+        canonical_cookie = "a1=fresh; web_session=fresh"
         validation = main.CreatorSessionValidation(valid=True)
         with (
             patch.object(
@@ -643,13 +653,17 @@ class CookieLoginRouteTests(unittest.TestCase):
                 "_validate_creator_session",
                 return_value=validation,
             ) as validate,
-            patch.object(main, "get_client", return_value=candidate),
+            patch.object(
+                main,
+                "get_active_client_and_cookie",
+                return_value=(candidate, canonical_cookie),
+            ),
             patch.object(main, "_save_and_swap_client") as save_and_swap,
         ):
             login_response = self.client.post(
                 "/login/cookie",
                 headers=self.headers,
-                json={"cookie": "a1=fresh; web_session=fresh"},
+                json={"cookie": canonical_cookie},
             )
             status_response = self.client.get(
                 "/session/status",
@@ -678,8 +692,8 @@ class CookieLoginRouteTests(unittest.TestCase):
         self.assertEqual(
             validate.call_args_list,
             [
-                unittest.mock.call(candidate, "a1=fresh; web_session=fresh"),
-                unittest.mock.call(candidate, candidate.cookie),
+                unittest.mock.call(candidate, canonical_cookie),
+                unittest.mock.call(candidate, canonical_cookie),
             ],
         )
 
@@ -699,6 +713,363 @@ class CookieLoginRouteTests(unittest.TestCase):
                     "a1=fresh; web_session=fresh",
                 )
                 self.assertEqual(os.stat(cookie_file).st_mode & 0o777, 0o600)
+
+
+class CanonicalActiveSessionCookieTests(unittest.TestCase):
+    """Regression coverage for the canonical active-session cookie fix.
+
+    Production root cause (deployed main a7bffcd): POST /login/cookie
+    validated the exact normalized Cookie header and persisted/swapped
+    successfully, but GET /session/status then validated
+    `active_client.cookie` — a requests cookie-jar re-serialization (via
+    xhs==0.2.13) taken after `_add_international_cookies`, which may be
+    mutated, reordered, or supplemented with defaults relative to what was
+    actually validated. This recreated false expiry despite a successful
+    candidate validation moments earlier.
+    """
+
+    def setUp(self):
+        self.client = TestClient(main.app)
+        self.headers = {"X-Api-Key": main.API_KEY}
+        self.original_client = main.client
+        self.original_active_cookie = main.active_cookie
+
+    def tearDown(self):
+        main.client = self.original_client
+        main.active_cookie = self.original_active_cookie
+
+    def test_status_survives_active_client_cookie_jar_mutation(self):
+        """(1) & (2): a successful candidate login followed by GET status
+        stays valid, and status validation receives the exact canonical
+        persisted header, even after the active client's cookie jar has
+        been mutated/reordered/supplemented with defaults."""
+        canonical_cookie = "a1=canary-a1; web_session=canary-session"
+        captured_cookie_headers = []
+
+        def fake_validate(xhs_client, cookie_header):
+            captured_cookie_headers.append(cookie_header)
+            return main.CreatorSessionValidation(valid=True)
+
+        with tempfile.TemporaryDirectory() as data_dir:
+            cookie_file = os.path.join(data_dir, "cookie.json")
+            with (
+                patch.object(main, "DATA_DIR", data_dir),
+                patch.object(main, "COOKIE_FILE", cookie_file),
+                patch.object(
+                    main, "_validate_creator_session", side_effect=fake_validate
+                ),
+            ):
+                login_response = self.client.post(
+                    "/login/cookie",
+                    headers=self.headers,
+                    json={"cookie": canonical_cookie},
+                )
+                self.assertEqual(login_response.status_code, 200)
+
+                # Simulate what xhs==0.2.13 / requests cookie-jar
+                # serialization can do after real usage: add unrelated
+                # defaults and mutate an existing entry in the active
+                # client's jar, without touching the persisted header.
+                main.client.session.cookies.set(
+                    "jar_added_default", "unexpected", domain=".rednote.com"
+                )
+                main.client.session.cookies.set("a1", "mutated-in-jar")
+
+                # Sanity: the jar-derived `.cookie` no longer matches the
+                # canonical header — exactly the discrepancy that caused
+                # the production false-expiry bug.
+                self.assertNotEqual(main.client.cookie, canonical_cookie)
+
+                status_response = self.client.get(
+                    "/session/status",
+                    headers=self.headers,
+                )
+
+        self.assertEqual(status_response.status_code, 200)
+        self.assertEqual(status_response.json()["valid"], True)
+        # Both the login candidate validation and the status validation
+        # must have received the exact canonical header, never the
+        # mutated/jar-derived cookie.
+        self.assertEqual(
+            captured_cookie_headers,
+            [canonical_cookie, canonical_cookie],
+        )
+
+    def test_lifespan_startup_initializes_client_and_canonical_cookie_pair(self):
+        """(3): startup loads the persisted canonical cookie, builds the
+        client, and initializes the client/cookie pair consistently."""
+        with tempfile.TemporaryDirectory() as data_dir:
+            cookie_file = os.path.join(data_dir, "cookie.json")
+            with (
+                patch.object(main, "DATA_DIR", data_dir),
+                patch.object(main, "COOKIE_FILE", cookie_file),
+            ):
+                main.save_cookie("a1=startup-value; web_session=startup-session")
+                main.client = None
+                main.active_cookie = None
+
+                asyncio.run(self._run_lifespan())
+
+                self.assertIsNotNone(main.client)
+                self.assertEqual(
+                    main.active_cookie,
+                    "a1=startup-value; web_session=startup-session",
+                )
+                self.assertEqual(
+                    main.client.cookie_dict.get("a1"), "startup-value"
+                )
+
+    @staticmethod
+    async def _run_lifespan():
+        async with main._lifespan(main.app):
+            pass
+
+    def test_concurrent_snapshot_and_swap_never_observes_mixed_pair(self):
+        """(4) & (5): deterministic concurrent snapshot/swap only ever
+        observes a complete old pair or complete new pair, never a mixed
+        client/cookie, and reader threads never block on the swapper (no
+        network I/O / long work happens while CLIENT_LOCK is held)."""
+        old_client = object()
+        new_client = object()
+        old_cookie = "a1=old; web_session=old"
+        new_cookie = "a1=new; web_session=new"
+        main.client = old_client
+        main.active_cookie = old_cookie
+
+        observed = []
+        observed_lock = threading.Lock()
+        stop = threading.Event()
+
+        def reader():
+            while not stop.is_set():
+                snapshot = main.get_active_client_and_cookie()
+                with observed_lock:
+                    observed.append(snapshot)
+
+        def swapper():
+            with tempfile.TemporaryDirectory() as data_dir:
+                cookie_file = os.path.join(data_dir, "cookie.json")
+                with (
+                    patch.object(main, "DATA_DIR", data_dir),
+                    patch.object(main, "COOKIE_FILE", cookie_file),
+                ):
+                    for _ in range(200):
+                        main._save_and_swap_client(new_cookie, new_client)
+                        main._save_and_swap_client(old_cookie, old_client)
+
+        reader_threads = [threading.Thread(target=reader) for _ in range(4)]
+        for thread in reader_threads:
+            thread.start()
+        swapper_thread = threading.Thread(target=swapper)
+        swapper_thread.start()
+        swapper_thread.join(timeout=10)
+        self.assertFalse(swapper_thread.is_alive(), "swapper deadlocked")
+        stop.set()
+        for thread in reader_threads:
+            thread.join(timeout=10)
+            self.assertFalse(thread.is_alive(), "reader deadlocked")
+
+        valid_pairs = {
+            (id(old_client), old_cookie),
+            (id(new_client), new_cookie),
+        }
+        self.assertTrue(observed)
+        for client_obj, cookie in observed:
+            self.assertIn((id(client_obj), cookie), valid_pairs)
+
+    def test_network_validation_runs_outside_client_lock(self):
+        """(5): network validation must run after CLIENT_LOCK is released,
+        never while it is held (which would risk a deadlock)."""
+        lock_states = []
+
+        def fake_validate(xhs_client, cookie_header):
+            acquired = main.CLIENT_LOCK.acquire(blocking=False)
+            lock_states.append(acquired)
+            if acquired:
+                main.CLIENT_LOCK.release()
+            return main.CreatorSessionValidation(valid=True)
+
+        main.client = object()
+        main.active_cookie = "a1=lockcheck; web_session=lockcheck"
+
+        with patch.object(
+            main, "_validate_creator_session", side_effect=fake_validate
+        ):
+            response = self.client.get("/session/status", headers=self.headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(lock_states, [True])
+
+    def test_failed_candidate_validation_preserves_old_pair_and_file(self):
+        """(6): failed candidate validation preserves the previous
+        in-memory client, canonical cookie, and persisted file."""
+        old_client = object()
+        old_cookie = "a1=working; web_session=working"
+        candidate = object()
+        with tempfile.TemporaryDirectory() as data_dir:
+            cookie_file = os.path.join(data_dir, "cookie.json")
+            with (
+                patch.object(main, "DATA_DIR", data_dir),
+                patch.object(main, "COOKIE_FILE", cookie_file),
+            ):
+                main.save_cookie(old_cookie)
+                main.client = old_client
+                main.active_cookie = old_cookie
+
+                with (
+                    patch.object(
+                        main, "_new_creator_client", return_value=candidate
+                    ),
+                    patch.object(
+                        main,
+                        "_validate_creator_session",
+                        return_value=main.CreatorSessionValidation(
+                            valid=False,
+                            error_code="creator_session_invalid",
+                            relogin_required=True,
+                            reason="http_401",
+                            upstream_status=401,
+                        ),
+                    ),
+                ):
+                    response = self.client.post(
+                        "/login/cookie",
+                        headers=self.headers,
+                        json={"cookie": "a1=rejected; web_session=rejected"},
+                    )
+
+                self.assertEqual(response.status_code, 401)
+                self.assertIs(main.client, old_client)
+                self.assertEqual(main.active_cookie, old_cookie)
+                self.assertEqual(main.load_cookie(), old_cookie)
+
+    def test_persistence_failure_preserves_old_pair_and_file(self):
+        """(7): a persistence failure (e.g. disk error) during candidate
+        swap preserves the previous in-memory client/cookie pair and the
+        previously persisted file."""
+        old_client = object()
+        old_cookie = "a1=working; web_session=working"
+        candidate = object()
+        with tempfile.TemporaryDirectory() as data_dir:
+            cookie_file = os.path.join(data_dir, "cookie.json")
+            with (
+                patch.object(main, "DATA_DIR", data_dir),
+                patch.object(main, "COOKIE_FILE", cookie_file),
+            ):
+                main.save_cookie(old_cookie)
+                main.client = old_client
+                main.active_cookie = old_cookie
+
+                with (
+                    patch.object(
+                        main, "_new_creator_client", return_value=candidate
+                    ),
+                    patch.object(
+                        main,
+                        "_validate_creator_session",
+                        return_value=main.CreatorSessionValidation(valid=True),
+                    ),
+                    patch.object(
+                        main, "save_cookie", side_effect=OSError("disk full")
+                    ),
+                ):
+                    # The global exception handler for a bare `Exception`
+                    # runs inside Starlette's ServerErrorMiddleware, which
+                    # re-raises after building the response so dev servers
+                    # still see it; use raise_server_exceptions=False so the
+                    # TestClient surfaces the sanitized response instead.
+                    lenient_client = TestClient(
+                        main.app, raise_server_exceptions=False
+                    )
+                    response = lenient_client.post(
+                        "/login/cookie",
+                        headers=self.headers,
+                        json={"cookie": "a1=newvalue; web_session=newvalue"},
+                    )
+
+                # The unhandled OSError is caught by the global exception
+                # handler and returns a sanitized 500, but must never swap
+                # the in-memory pair or leave the file inconsistent.
+                self.assertEqual(response.status_code, 500)
+                self.assertIs(main.client, old_client)
+                self.assertEqual(main.active_cookie, old_cookie)
+                self.assertEqual(main.load_cookie(), old_cookie)
+
+    def test_status_with_no_persisted_cookie_returns_invalid_not_500(self):
+        """Cold-start / lost-file edge case: when no cookie has ever been
+        persisted, `active_cookie` is the empty string. Status must return a
+        graceful sanitized invalid-session result, not an unhandled 500 from
+        Cookie-header parsing. (Regression found during independent review:
+        pre-fix, `_add_international_cookies()` always populated the jar
+        with defaults so `active_client.cookie` was never empty; post-fix,
+        the canonical `active_cookie` can legitimately be empty before the
+        first successful login.)"""
+        with tempfile.TemporaryDirectory() as data_dir:
+            cookie_file = os.path.join(data_dir, "cookie.json")
+            with (
+                patch.object(main, "DATA_DIR", data_dir),
+                patch.object(main, "COOKIE_FILE", cookie_file),
+            ):
+                main.client = None
+                main.active_cookie = None
+
+                response = self.client.get(
+                    "/session/status", headers=self.headers
+                )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["valid"], False)
+        self.assertEqual(body["relogin_required"], True)
+        self.assertEqual(body["error"]["code"], "creator_session_invalid")
+        self.assertEqual(body["error"]["reason"], "no_active_session")
+
+    def test_no_cookie_leakage_across_login_and_status_flow(self):
+        """(8): no cookie names/values are ever logged, echoed, or printed
+        across a full successful login + status flow."""
+        canary_a1 = "canary-a1-abcdef123456"
+        canary_session = "canary-web-session-abcdef123456"
+        canonical_cookie = f"a1={canary_a1}; web_session={canary_session}"
+
+        def fake_validate(xhs_client, cookie_header):
+            self.assertEqual(cookie_header, canonical_cookie)
+            return main.CreatorSessionValidation(valid=True)
+
+        stdout = io.StringIO()
+        with tempfile.TemporaryDirectory() as data_dir:
+            cookie_file = os.path.join(data_dir, "cookie.json")
+            with (
+                patch.object(main, "DATA_DIR", data_dir),
+                patch.object(main, "COOKIE_FILE", cookie_file),
+                patch.object(
+                    main, "_validate_creator_session", side_effect=fake_validate
+                ),
+                patch.object(main.logger, "info") as log_info,
+                patch.object(main.logger, "warning") as log_warning,
+                patch.object(main.logger, "error") as log_error,
+                redirect_stdout(stdout),
+            ):
+                login_response = self.client.post(
+                    "/login/cookie",
+                    headers=self.headers,
+                    json={"cookie": canonical_cookie},
+                )
+                status_response = self.client.get(
+                    "/session/status",
+                    headers=self.headers,
+                )
+
+        self.assertEqual(login_response.status_code, 200)
+        self.assertEqual(status_response.status_code, 200)
+
+        pieces = [login_response.text, status_response.text, stdout.getvalue()]
+        for handler in (log_info, log_warning, log_error):
+            for call in handler.call_args_list:
+                pieces.append(" ".join(str(arg) for arg in call.args))
+        combined_output = " ".join(pieces)
+
+        for canary in (canary_a1, canary_session):
+            self.assertNotIn(canary, combined_output)
 
 
 class CreatorSessionValidationTests(unittest.TestCase):

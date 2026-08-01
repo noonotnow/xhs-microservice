@@ -128,7 +128,12 @@ shapes return sanitized HTTP 502 `creator_session_validation_unavailable`
 without replacing the session.
 
 `GET /session/status` uses the same Creator upload-permit boundary and returns
-stable sanitized metadata without forwarding the permit payload:
+stable sanitized metadata without forwarding the permit payload. Validation is
+always performed against the exact canonical Cookie header persisted at the
+last successful `POST /login/cookie`, never against the active client's
+internal cookie-jar state (which may reorder, mutate, or supplement submitted
+cookies with defaults during normal use and would otherwise cause a spurious
+false-expiry result):
 
 ```json
 {

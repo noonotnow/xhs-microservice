@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -30,7 +31,18 @@ from xhs.help import sign as creator_sign
 from xhshow import Xhshow
 from sign_service import sign
 
-app = FastAPI(title="XHS Microservice", version="1.0.0")
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    # Load the persisted canonical cookie and build the client pair at boot
+    # so `client`/`active_cookie` are populated consistently before the
+    # first request is served, rather than relying solely on lazy
+    # initialization on first access.
+    get_client()
+    yield
+
+
+app = FastAPI(title="XHS Microservice", version="1.0.0", lifespan=_lifespan)
 logger = logging.getLogger("xhs-microservice")
 
 app.add_middleware(
@@ -96,6 +108,7 @@ CREATOR_SESSION_INVALID_REASONS = frozenset({
     "http_401",
     "http_403",
     "api_session_expired",
+    "no_active_session",
 })
 UPLOAD_TOKEN_MAX_LIFETIME_SECONDS = 5 * 60
 BASE64URL_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -122,7 +135,15 @@ REMOTE_VIDEO_TIMEOUT = httpx.Timeout(
 )
 
 # --- Persistent client (singleton) ---
+# `client` and `active_cookie` are an atomically paired unit: `active_cookie`
+# is always the exact canonical (parsed/normalized) Cookie header that was
+# validated and persisted for `client`. They must only ever be read or
+# written together while holding CLIENT_LOCK. Never derive the canonical
+# cookie from `client.cookie` (a requests cookie-jar re-serialization), which
+# may reorder, mutate, or supplement cookies with defaults and therefore does
+# not match what was actually validated.
 client: XhsClient | None = None
+active_cookie: str | None = None
 
 
 def require_api_key(x_api_key: str | None):
@@ -296,13 +317,37 @@ def save_cookie(cookie_str: str):
         Path(temp_path).unlink(missing_ok=True)
 
 
+def _ensure_client_initialized_locked() -> None:
+    """Lazily build the client/cookie pair from persisted storage.
+
+    Caller must already hold CLIENT_LOCK. Does not itself acquire the lock,
+    so it is safe to call from any function that is already holding it
+    (avoids nested/re-entrant locking, since CLIENT_LOCK is not reentrant).
+    """
+    global client, active_cookie
+    if client is None:
+        active_cookie = load_cookie()
+        client = _new_creator_client(active_cookie)
+
+
 def get_client() -> XhsClient:
     """Get or create the persistent XhsClient singleton."""
-    global client
     with CLIENT_LOCK:
-        if client is None:
-            client = _new_creator_client(load_cookie())
-    return client
+        _ensure_client_initialized_locked()
+        return client
+
+
+def get_active_client_and_cookie() -> tuple[XhsClient, str]:
+    """Atomically snapshot the active client and its canonical Cookie header.
+
+    Acquires CLIENT_LOCK only long enough to read both values together as a
+    single consistent pair, then releases it. Callers must perform any
+    network validation with the returned snapshot *after* this function
+    returns, never while CLIENT_LOCK is held.
+    """
+    with CLIENT_LOCK:
+        _ensure_client_initialized_locked()
+        return client, active_cookie
 
 
 def _add_international_cookies(xhs_client):
@@ -330,10 +375,17 @@ def _add_international_cookies(xhs_client):
 
 
 def _save_and_swap_client(cookie: str, replacement: XhsClient):
-    global client
+    """Atomically persist and install a validated client/cookie pair.
+
+    If save_cookie raises (e.g. disk failure), neither `client` nor
+    `active_cookie` is updated, so the previous in-memory pair and the
+    previously persisted file remain intact and consistent.
+    """
+    global client, active_cookie
     with CLIENT_LOCK:
         save_cookie(cookie)
         client = replacement
+        active_cookie = cookie
 
 
 def _clear_qr_state() -> None:
@@ -796,6 +848,18 @@ def _validate_creator_session(
             valid=False,
             error_code="creator_session_validation_unavailable",
         )
+    except ValueError:
+        # No canonical cookie has ever been persisted (fresh deploy, or the
+        # persisted file was lost) so there is nothing to validate. Treat
+        # this the same as any other invalid session rather than letting
+        # the parse error propagate as an unhandled 500.
+        logger.info("Creator session invalid reason=no_active_session")
+        return CreatorSessionValidation(
+            valid=False,
+            error_code="creator_session_invalid",
+            relogin_required=True,
+            reason="no_active_session",
+        )
 
     upstream_status = _safe_upstream_number(response.status_code)
     if response.is_redirect or response.is_permanent_redirect:
@@ -978,9 +1042,14 @@ def login_with_cookie(req: CookieLoginRequest, x_api_key: str | None = Header(No
 @app.get("/session/status")
 def session_status(x_api_key: str | None = Header(None)):
     require_api_key(x_api_key)
-    active_client = get_client()
+    # Snapshot the client and its exact canonical (persisted/normalized)
+    # Cookie header together, then validate outside CLIENT_LOCK. Never
+    # validate against `active_client.cookie` (a requests cookie-jar
+    # re-serialization), which may reorder, mutate, or add default cookies
+    # relative to what was actually validated and persisted at login.
+    active_client, canonical_cookie = get_active_client_and_cookie()
     return _session_status_payload(
-        _validate_creator_session(active_client, active_client.cookie),
+        _validate_creator_session(active_client, canonical_cookie),
         "active_session",
     )
 
