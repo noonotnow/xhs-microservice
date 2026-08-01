@@ -76,7 +76,20 @@ rejected QR attempts return `expired: true` and are removed so the next
 If XHS rejects the Creator CAS flow, the endpoint returns a sanitized 502
 without cookies, tickets, or tracebacks. Use the existing authenticated
 `POST /login/cookie` operation as the manual fallback; no Railway environment
-or volume change is required.
+or volume change is required. Its JSON `cookie` field accepts only the value of
+an authenticated browser request's `Cookie` header:
+
+```json
+{"cookie": "a1=<value>; web_session=<value>; webId=<value>"}
+```
+
+Do not paste a DevTools cookie table export; domain, path, expiry, and other
+columns are rejected. Cookies copied from a fresh authenticated
+`creator.rednote.com` request are supported: the pinned client receives the
+name/value pairs directly, so they do not have to originate from a
+`xiaohongshu.com` domain. Both `a1` and `web_session` are required. Cookie
+values are never logged or returned, and invalid-session responses are
+sanitized.
 
 ## Publishing Flow
 
