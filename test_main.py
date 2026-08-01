@@ -1,10 +1,12 @@
 import asyncio
+import io
 import json
 import os
 import sys
 import tempfile
 import types
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -101,6 +103,91 @@ class CreatorQRProtocolTests(unittest.TestCase):
             json.loads(response.body),
             {"error": "Internal server error"},
         )
+
+
+class DebugPermitProbeSecurityTests(unittest.TestCase):
+    def test_publish_steps_never_calls_or_echoes_permit_probes(self):
+        permit_token = "synthetic-permit-token-canary"
+        permit_file_id = "synthetic-permit-file-id-canary"
+        raw_payload = "synthetic-raw-payload-canary"
+        upstream_header = "synthetic-upstream-header-canary"
+        cookie_value = "synthetic-cookie-canary"
+
+        class FakeClient:
+            cookie_dict = {"a1": cookie_value}
+
+            def __init__(self):
+                self.get_calls = []
+
+            def get_self_info(self):
+                return {}
+
+            def get(self, uri, *args, **kwargs):
+                self.get_calls.append(uri)
+                if "permit" in uri:
+                    payload = {
+                        "uploadTempPermits": [
+                            {
+                                "token": permit_token,
+                                "fileIds": [permit_file_id],
+                            }
+                        ],
+                        "raw": raw_payload,
+                        "headers": {"X-Synthetic": upstream_header},
+                        "cookie": cookie_value,
+                    }
+                    print(payload)
+                    return payload
+                return {}
+
+            def get_suggest_topic(self, keyword):
+                return []
+
+        fake_client = FakeClient()
+        stdout = io.StringIO()
+        with (
+            patch.object(main, "get_client", return_value=fake_client),
+            patch(
+                "sign_service.sign",
+                return_value={
+                    "x-s": "synthetic-signature",
+                    "x-s-common": "synthetic-common",
+                },
+            ),
+            patch.object(main.logger, "info") as log_info,
+            patch.object(main.logger, "warning") as log_warning,
+            patch.object(main.logger, "error") as log_error,
+            redirect_stdout(stdout),
+        ):
+            response = TestClient(main.app).get(
+                "/debug/publish-steps",
+                headers={"X-Api-Key": main.API_KEY},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json()["2_upload_permit"],
+            {"ok": False, "disabled": True},
+        )
+        self.assertEqual(
+            response.json()["2b_creator_upload_permit"],
+            {"ok": False, "disabled": True},
+        )
+        self.assertFalse(
+            any("permit" in uri for uri in fake_client.get_calls)
+        )
+        log_info.assert_not_called()
+        log_warning.assert_not_called()
+        log_error.assert_not_called()
+        output = " ".join((response.text, stdout.getvalue()))
+        for canary in (
+            permit_token,
+            permit_file_id,
+            raw_payload,
+            upstream_header,
+            cookie_value,
+        ):
+            self.assertNotIn(canary, output)
 
 
 class CookieLoginRouteTests(unittest.TestCase):

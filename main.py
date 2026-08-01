@@ -1629,31 +1629,10 @@ def debug_publish_steps(x_api_key: str | None = Header(None)):
     except Exception as e:
         results["1b_creator_self_info"] = {"ok": False, "error": str(e)}
 
-    # Step 2: get_upload_files_permit (manual with is_creator=True)
-    try:
-        uri = "/api/media/v1/upload/web/permit"
-        params = {"biz_name": "spectrum", "scene": "image", "file_count": 1, "version": "1", "source": "web"}
-        res = xhs.get(uri, params, is_creator=True)
-        results["2_upload_permit"] = {
-            "ok": bool(res.get("uploadTempPermits"))
-            if isinstance(res, dict)
-            else False
-        }
-    except Exception:
-        results["2_upload_permit"] = {"ok": False}
-
-    # Step 2b: creator upload permit (the exact URL from Katie's browser)
-    try:
-        uri = "/api/media/v1/upload/creator/permit"
-        params = {"biz_name": "spectrum", "scene": "image", "file_count": 1, "version": "1", "source": "web"}
-        res = xhs.get(uri, params, is_creator=True)
-        results["2b_creator_upload_permit"] = {
-            "ok": bool(res.get("uploadTempPermits"))
-            if isinstance(res, dict)
-            else False
-        }
-    except Exception:
-        results["2b_creator_upload_permit"] = {"ok": False}
+    # XhsClient.request prints decoded responses in the pinned dependency.
+    # Permit probes stay disabled so credentials cannot reach process stdout.
+    results["2_upload_permit"] = {"ok": False, "disabled": True}
+    results["2b_creator_upload_permit"] = {"ok": False, "disabled": True}
 
     # Step 3: get_suggest_topic
     try:
