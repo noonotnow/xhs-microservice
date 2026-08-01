@@ -61,11 +61,19 @@ ahead. Use a separate high-entropy secret from `XHS_API_KEY`.
 3. Poll `GET /login/status` until `code_status == 2`
 4. Session cookie is saved automatically
 
-QR creation always starts with a fresh anonymous XHS client, so an expired
-production cookie cannot prevent regeneration. Polling state, including the
-temporary login cookies required to resume after a container restart, is stored
-in `qr_state.json`. Expired or rejected QR attempts return `expired: true` and
-are removed so the next `/login/qr` call starts cleanly.
+QR creation uses XHS's Creator CAS QR flow with a fresh anonymous client, so an
+expired production cookie cannot prevent regeneration. The legacy web QR
+endpoint used by `xhs==0.2.13` is no longer accepted by XHS; this service
+backports only the upstream Creator CAS requests while keeping the publishing
+client pinned. Polling state, including the temporary login cookies required to
+resume after a container restart, is stored in `qr_state.json`. Expired or
+rejected QR attempts return `expired: true` and are removed so the next
+`/login/qr` call starts cleanly.
+
+If XHS rejects the Creator CAS flow, the endpoint returns a sanitized 502
+without cookies, tickets, or tracebacks. Use the existing authenticated
+`POST /login/cookie` operation as the manual fallback; no Railway environment
+or volume change is required.
 
 ## Publishing Flow
 
