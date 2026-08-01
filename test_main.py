@@ -216,6 +216,13 @@ class QRLoginRouteTests(unittest.TestCase):
 
 
 class CreatorQRProtocolTests(unittest.TestCase):
+    def test_health_reports_deployed_revision(self):
+        with patch.object(main, "APP_REVISION", "commit-sha"):
+            response = TestClient(main.app).get("/health")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["revision"], "commit-sha")
+
     def test_creator_qr_uses_customer_cas_endpoint_and_quick_signature(self):
         class Response:
             status_code = 200

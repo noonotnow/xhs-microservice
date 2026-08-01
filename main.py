@@ -59,6 +59,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 # --- Config ---
 API_KEY = os.getenv("XHS_API_KEY", "change-me-in-production")
 UPLOAD_TOKEN_SECRET = os.getenv("UPLOAD_TOKEN_SECRET")
+APP_REVISION = os.getenv("RAILWAY_GIT_COMMIT_SHA", "unknown")
 DATA_DIR = os.getenv("DATA_DIR", "/app/data")
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/app/data/uploads")
 COOKIE_FILE = os.path.join(DATA_DIR, "cookie.json")
@@ -1369,7 +1370,11 @@ async def publish_video_url(
 # --- Health Check ---
 @app.get("/health")
 def health():
-    return {"status": "ok", "has_cookie": os.path.exists(COOKIE_FILE)}
+    return {
+        "status": "ok",
+        "has_cookie": os.path.exists(COOKIE_FILE),
+        "revision": APP_REVISION,
+    }
 
 
 # --- Debug: test signing function ---
