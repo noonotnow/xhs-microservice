@@ -58,26 +58,27 @@ ahead. Use a separate high-entropy secret from `XHS_API_KEY`.
 
 ## QR Login Flow
 
-1. `GET /login/qr` → replaces any stale login attempt and returns
-   `{qr_id, code, url, expires_at}`
-2. Convert `url` to QR code image, scan with XHS app
-3. Poll `GET /login/status` until `code_status == 2`
-4. Session cookie is saved automatically
+QR login is disabled. The available Creator CAS endpoint produces
+merchant/Qianfan (`小红书商家版`) identity links, not normal Rednote creator
+login. The service never returns those links or asks an operator to authorize
+them.
 
-QR creation uses XHS's Creator CAS QR flow with a fresh anonymous client, so an
-expired production cookie cannot prevent regeneration. The legacy web QR
-endpoint used by `xhs==0.2.13` is no longer accepted by XHS; this service
-backports only the upstream Creator CAS requests while keeping the publishing
-client pinned. Polling state, including the temporary login cookies required to
-resume after a container restart, is stored in `qr_state.json`. Expired or
-rejected QR attempts return `expired: true` and are removed so the next
-`/login/qr` call starts cleanly.
+Authenticated `GET /login/qr` and `GET /login/status` both clear stale QR state
+and return HTTP 503 with:
 
-If XHS rejects the Creator CAS flow, the endpoint returns a sanitized 502
-without cookies, tickets, or tracebacks. Use the existing authenticated
-`POST /login/cookie` operation as the manual fallback; no Railway environment
-or volume change is required. Its JSON `cookie` field accepts only the value of
-an authenticated browser request's `Cookie` header:
+```json
+{
+  "detail": {
+    "code": "CREATOR_QR_UNAVAILABLE",
+    "message": "QR login is disabled ... Use manual cookie login ... https://creator.rednote.com/login."
+  }
+}
+```
+
+Responses are marked `Cache-Control: no-store`. Use authenticated
+`POST /login/cookie` as the only supported recovery; no Railway environment or
+volume change is required. Its JSON `cookie` field accepts only the value of an
+authenticated browser request's `Cookie` header:
 
 ```json
 {"cookie": "a1=<value>; web_session=<value>; webId=<value>"}
