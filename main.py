@@ -90,6 +90,7 @@ REDNOTE_CREATOR_VALIDATION_URI = (
     "?biz_name=spectrum&scene=image&file_count=1&version=1&source=web"
 )
 XHS_SESSION_EXPIRED_RESULT = -100
+MISSING_UPSTREAM_FIELD = object()
 CREATOR_SESSION_INVALID_REASONS = frozenset({
     "redirect",
     "http_401",
@@ -698,6 +699,52 @@ def _safe_upstream_number(value) -> int | None:
     return value if type(value) is int else None
 
 
+def _has_usable_upload_permit(data) -> bool:
+    if not isinstance(data, dict):
+        return False
+    permits = data.get("uploadTempPermits")
+    if not isinstance(permits, list) or not permits:
+        return False
+    permit = permits[0]
+    if not isinstance(permit, dict):
+        return False
+    file_ids = permit.get("fileIds")
+    token = permit.get("token")
+    return (
+        isinstance(file_ids, list)
+        and bool(file_ids)
+        and isinstance(file_ids[0], str)
+        and bool(file_ids[0].strip())
+        and isinstance(token, str)
+        and bool(token.strip())
+    )
+
+
+def _has_unambiguous_permit_success(payload: dict, data: dict) -> bool:
+    top_success = payload.get("success", MISSING_UPSTREAM_FIELD)
+    top_code = payload.get("code", MISSING_UPSTREAM_FIELD)
+    top_contract_present = (
+        top_success is not MISSING_UPSTREAM_FIELD
+        or top_code is not MISSING_UPSTREAM_FIELD
+    )
+    top_contract_valid = (
+        top_success is True and _safe_upstream_number(top_code) == 0
+    )
+
+    nested_result = data.get("result", MISSING_UPSTREAM_FIELD)
+    nested_contract_present = nested_result is not MISSING_UPSTREAM_FIELD
+    nested_contract_valid = (
+        isinstance(nested_result, dict)
+        and nested_result.get("success") is True
+    )
+
+    if top_contract_present and not top_contract_valid:
+        return False
+    if nested_contract_present and not nested_contract_valid:
+        return False
+    return top_contract_valid or nested_contract_valid
+
+
 def _request_creator_validation(
     xhs_client: XhsClient,
     cookie_header: str,
@@ -807,41 +854,23 @@ def _validate_creator_session(
     has_usable_permit = False
     if isinstance(payload, dict):
         code = _safe_upstream_number(payload.get("code"))
-        result = _safe_upstream_number(payload.get("result"))
+        raw_result = payload.get("result", MISSING_UPSTREAM_FIELD)
+        result = _safe_upstream_number(raw_result)
         upstream_code = (
             XHS_SESSION_EXPIRED_RESULT
             if XHS_SESSION_EXPIRED_RESULT in (code, result)
             else code if code is not None else result
         )
         data = payload.get("data")
-        permits = (
-            data.get("uploadTempPermits")
-            if isinstance(data, dict)
-            else None
+        has_usable_permit = (
+            isinstance(data, dict)
+            and (
+                raw_result is MISSING_UPSTREAM_FIELD
+                or result == 0
+            )
+            and _has_unambiguous_permit_success(payload, data)
+            and _has_usable_upload_permit(data)
         )
-        if isinstance(permits, list) and permits:
-            permit = permits[0]
-            file_ids = (
-                permit.get("fileIds")
-                if isinstance(permit, dict)
-                else None
-            )
-            token = (
-                permit.get("token")
-                if isinstance(permit, dict)
-                else None
-            )
-            has_usable_permit = (
-                payload.get("success") is True
-                and code in (None, 0)
-                and result in (None, 0)
-                and isinstance(file_ids, list)
-                and bool(file_ids)
-                and isinstance(file_ids[0], str)
-                and bool(file_ids[0].strip())
-                and isinstance(token, str)
-                and bool(token.strip())
-            )
     if upstream_code == XHS_SESSION_EXPIRED_RESULT:
         logger.info(
             "Creator session invalid reason=api_session_expired "
@@ -874,6 +903,7 @@ def _validate_creator_session(
 
 def _session_status_payload(
     validation: CreatorSessionValidation,
+    source: str,
 ) -> dict:
     result = {
         "valid": validation.valid,
@@ -882,6 +912,7 @@ def _session_status_payload(
             "method": "creator_upload_permit",
             "host": "creator.rednote.com",
             "path": REDNOTE_CREATOR_VALIDATION_PATH,
+            "source": source,
         },
         "relogin_required": validation.relogin_required,
     }
@@ -931,7 +962,7 @@ def login_with_cookie(req: CookieLoginRequest, x_api_key: str | None = Header(No
     normalized_cookie = _cookie_header_string(cookies)
     candidate = _new_creator_client(normalized_cookie)
     validation = _validate_creator_session(candidate, normalized_cookie)
-    status = _session_status_payload(validation)
+    status = _session_status_payload(validation, "cookie_login_candidate")
     if not validation.valid:
         return JSONResponse(
             status_code=401 if validation.relogin_required else 502,
@@ -947,7 +978,8 @@ def session_status(x_api_key: str | None = Header(None)):
     require_api_key(x_api_key)
     active_client = get_client()
     return _session_status_payload(
-        _validate_creator_session(active_client, active_client.cookie)
+        _validate_creator_session(active_client, active_client.cookie),
+        "active_session",
     )
 
 
