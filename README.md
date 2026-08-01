@@ -32,6 +32,9 @@ backward compatibility, `/upload` accepts that header or a short-lived
 `Authorization: Upload <token>` header. Upload tokens are not accepted by any
 other endpoint.
 
+`GET /health` includes Railway's `RAILWAY_GIT_COMMIT_SHA` as `revision` (or
+`"unknown"` outside Railway) so operators can verify which build is live.
+
 ### Browser Upload Authorization
 
 The server that renders the browser client should generate a fresh upload token
