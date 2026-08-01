@@ -85,6 +85,13 @@ authenticated browser request's `Cookie` header:
 {"cookie": "a1=<value>; web_session=<value>; webId=<value>"}
 ```
 
+Pasting the full Request Headers line is also supported: a single
+case-insensitive leading `Cookie:` label, outer spaces, and one trailing copied
+newline are removed before validation. Pair order is retained. Embedded
+newlines, additional headers, tabs, other control characters, malformed pairs,
+invalid or duplicate names, and oversized inputs are rejected before client
+creation, signing, validation, or persistence.
+
 Do not paste a DevTools cookie table export; domain, path, expiry, and other
 columns are rejected. Cookies copied from a fresh authenticated
 `creator.rednote.com` request are supported: the pinned client receives the
@@ -92,6 +99,26 @@ name/value pairs as an explicit request-local `Cookie` header, bypassing
 Requests cookie-jar domain and path filtering. Supplemental defaults never
 replace submitted cookie names. Both `a1` and `web_session` are required.
 Cookie values and names are never logged or returned.
+
+Cookie ingestion failures return HTTP 400 in FastAPI's existing `detail`
+envelope with only a stable code and fixed safe message:
+
+```json
+{
+  "detail": {
+    "code": "cookie_header_control_character",
+    "message": "Cookie request header contains an unsupported control character."
+  }
+}
+```
+
+Parse codes are `cookie_header_control_character`,
+`cookie_header_invalid_name`, `cookie_header_duplicate_name`,
+`cookie_header_missing_equals`, `cookie_header_too_large`, and
+`cookie_header_empty`. A syntactically valid header without the required
+non-empty Creator session fields returns `cookie_required_session_fields`.
+These responses never include submitted names, values, lengths, raw input,
+headers, exception text, or upstream details.
 
 The copied Request Header may contain pairs selected by the browser from both
 `.rednote.com` and `creator.rednote.com` scopes, including host-specific

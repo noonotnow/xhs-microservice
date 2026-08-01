@@ -19,6 +19,7 @@ import uuid
 import shutil
 import threading
 import traceback
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -100,6 +101,27 @@ CREATOR_SESSION_INVALID_REASONS = frozenset({
 UPLOAD_TOKEN_MAX_LIFETIME_SECONDS = 5 * 60
 BASE64URL_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 COOKIE_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+COOKIE_HEADER_ERROR_MESSAGES = {
+    "cookie_header_control_character": (
+        "Cookie request header contains an unsupported control character."
+    ),
+    "cookie_header_invalid_name": (
+        "Cookie request header contains an invalid field name."
+    ),
+    "cookie_header_duplicate_name": (
+        "Cookie request header contains an ambiguous duplicate field."
+    ),
+    "cookie_header_missing_equals": (
+        "Cookie request header contains a malformed pair."
+    ),
+    "cookie_header_too_large": (
+        "Cookie request header exceeds the accepted size."
+    ),
+    "cookie_header_empty": "Cookie request header is empty.",
+    "cookie_required_session_fields": (
+        "Cookie request header is missing required non-empty session fields."
+    ),
+}
 TRUSTED_MEDIA_VIDEO_HOSTS = {
     host.strip().lower()
     for host in os.getenv(
@@ -220,32 +242,65 @@ def load_cookie() -> str:
     return ""
 
 
+class CookieHeaderParseError(ValueError):
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
+
+
+def _cookie_header_error(code: str) -> CookieHeaderParseError:
+    return CookieHeaderParseError(code)
+
+
+def _normalize_cookie_header_input(cookie_header: str) -> str:
+    if not cookie_header:
+        raise _cookie_header_error("cookie_header_empty")
+    try:
+        encoded_size = len(cookie_header.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise _cookie_header_error(
+            "cookie_header_control_character"
+        ) from exc
+    if encoded_size > MAX_COOKIE_HEADER_BYTES:
+        raise _cookie_header_error("cookie_header_too_large")
+
+    normalized = cookie_header.strip(" ")
+    if normalized.endswith("\r\n"):
+        normalized = normalized[:-2].strip(" ")
+    elif normalized.endswith(("\r", "\n")):
+        normalized = normalized[:-1].strip(" ")
+
+    if any(unicodedata.category(char) == "Cc" for char in normalized):
+        raise _cookie_header_error("cookie_header_control_character")
+
+    if normalized[:7].lower() == "cookie:":
+        normalized = normalized[7:].strip(" ")
+    if not normalized:
+        raise _cookie_header_error("cookie_header_empty")
+    return normalized
+
+
 def _parse_cookie_header(cookie_header: str) -> dict[str, str]:
     """Validate unique Cookie pairs while retaining submitted pair order."""
-    if not cookie_header or not cookie_header.strip():
-        raise ValueError("Cookie header is empty")
-    if len(cookie_header.encode("utf-8")) > MAX_COOKIE_HEADER_BYTES:
-        raise ValueError("Cookie header is too large")
-    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in cookie_header):
-        raise ValueError("Cookie header contains control characters")
+    normalized = _normalize_cookie_header_input(cookie_header)
 
     cookies = {}
-    for block in cookie_header.split(";"):
-        block = block.strip()
+    for block in normalized.split(";"):
+        block = block.strip(" ")
         if not block:
             continue
         if "=" not in block:
-            raise ValueError("Cookie pair is missing '='")
+            raise _cookie_header_error("cookie_header_missing_equals")
         name, value = block.split("=", 1)
-        name = name.strip()
-        value = value.strip()
+        name = name.strip(" ")
+        value = value.strip(" ")
         if not COOKIE_NAME_RE.fullmatch(name):
-            raise ValueError("Cookie name is invalid")
+            raise _cookie_header_error("cookie_header_invalid_name")
         if name in cookies:
-            raise ValueError("Cookie name is duplicated")
+            raise _cookie_header_error("cookie_header_duplicate_name")
         cookies[name] = value
     if not cookies:
-        raise ValueError("Cookie header contains no cookie pairs")
+        raise _cookie_header_error("cookie_header_empty")
     return cookies
 
 
@@ -944,22 +999,23 @@ def login_with_cookie(req: CookieLoginRequest, x_api_key: str | None = Header(No
     require_api_key(x_api_key)
     try:
         cookies = _parse_cookie_header(req.cookie)
-    except ValueError as exc:
+    except CookieHeaderParseError as exc:
         raise HTTPException(
             status_code=400,
-            detail=(
-                "Expected a Cookie request-header value in "
-                "'name=value; name=value' format. DevTools cookie table "
-                "exports are not accepted."
-            ),
+            detail={
+                "code": exc.code,
+                "message": COOKIE_HEADER_ERROR_MESSAGES[exc.code],
+            },
         ) from exc
     if not cookies.get("a1") or not cookies.get("web_session"):
         raise HTTPException(
             status_code=400,
-            detail=(
-                "Cookie header must include non-empty a1 and web_session "
-                "cookies from a fresh authenticated Creator request."
-            ),
+            detail={
+                "code": "cookie_required_session_fields",
+                "message": COOKIE_HEADER_ERROR_MESSAGES[
+                    "cookie_required_session_fields"
+                ],
+            },
         )
     normalized_cookie = _cookie_header_string(cookies)
     candidate = _new_creator_client(normalized_cookie)

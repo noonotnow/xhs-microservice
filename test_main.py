@@ -193,6 +193,56 @@ class CookieLoginRouteTests(unittest.TestCase):
     def tearDown(self):
         main.client = self.original_client
 
+    def assert_cookie_parse_failure(
+        self,
+        submitted_cookie,
+        expected_code,
+        canaries=(),
+    ):
+        working_client = object()
+        main.client = working_client
+        stdout = io.StringIO()
+        with (
+            patch.object(main, "_new_creator_client") as new_client,
+            patch.object(main, "creator_sign") as creator_sign,
+            patch.object(main, "_validate_creator_session") as validate,
+            patch.object(main, "_save_and_swap_client") as save_and_swap,
+            patch.object(main, "save_cookie") as save_cookie,
+            patch.object(main.logger, "info") as log_info,
+            patch.object(main.logger, "warning") as log_warning,
+            patch.object(main.logger, "error") as log_error,
+            redirect_stdout(stdout),
+        ):
+            response = self.client.post(
+                "/login/cookie",
+                headers=self.headers,
+                json={"cookie": submitted_cookie},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.json(),
+            {
+                "detail": {
+                    "code": expected_code,
+                    "message": main.COOKIE_HEADER_ERROR_MESSAGES[expected_code],
+                }
+            },
+        )
+        new_client.assert_not_called()
+        creator_sign.assert_not_called()
+        validate.assert_not_called()
+        save_and_swap.assert_not_called()
+        save_cookie.assert_not_called()
+        log_info.assert_not_called()
+        log_warning.assert_not_called()
+        log_error.assert_not_called()
+        self.assertIs(main.client, working_client)
+        output = " ".join((response.text, stdout.getvalue()))
+        for canary in canaries:
+            self.assertNotIn(canary, output)
+        return response
+
     def test_accepts_only_creator_valid_cookie_and_preserves_equals_in_value(self):
         candidate = object()
         submitted_cookie = (
@@ -230,6 +280,40 @@ class CookieLoginRouteTests(unittest.TestCase):
             "session-with-padding==",
         ):
             self.assertNotIn(cookie_value, response.text)
+
+    def test_accepts_optional_cookie_label_outer_spaces_and_trailing_newline(self):
+        normalized = "a1=synthetic; web_session=synthetic"
+        submissions = (
+            normalized,
+            f"  cOoKiE:  {normalized}  \r\n  ",
+            f"COOKIE: {normalized}\n",
+        )
+        for submitted in submissions:
+            candidate = object()
+            with (
+                self.subTest(submitted=submitted),
+                patch.object(
+                    main,
+                    "_new_creator_client",
+                    return_value=candidate,
+                ) as new_client,
+                patch.object(
+                    main,
+                    "_validate_creator_session",
+                    return_value=main.CreatorSessionValidation(valid=True),
+                ) as validate,
+                patch.object(main, "_save_and_swap_client") as save_and_swap,
+            ):
+                response = self.client.post(
+                    "/login/cookie",
+                    headers=self.headers,
+                    json={"cookie": submitted},
+                )
+
+            self.assertEqual(response.status_code, 200)
+            new_client.assert_called_once_with(normalized)
+            validate.assert_called_once_with(candidate, normalized)
+            save_and_swap.assert_called_once_with(normalized, candidate)
 
     def test_nested_creator_permit_response_returns_only_sanitized_status(self):
         candidate = object()
@@ -289,61 +373,113 @@ class CookieLoginRouteTests(unittest.TestCase):
         for permit_value in (permit_token, permit_file_id):
             self.assertNotIn(permit_value, response.text)
 
-    def test_rejects_devtools_table_export_without_echoing_input(self):
-        response = self.client.post(
-            "/login/cookie",
-            headers=self.headers,
-            json={
-                "cookie": (
-                    "web_session\tsecret-value\t.rednote.com\t/\tSession"
-                )
-            },
-        )
-
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(
-            response.json()["detail"],
+    def test_rejects_malformed_cookie_headers_with_stable_sanitized_codes(self):
+        cases = (
             (
-                "Expected a Cookie request-header value in "
-                "'name=value; name=value' format. DevTools cookie table "
-                "exports are not accepted."
+                "devtools table export",
+                "web_session\ttable-canary\t.rednote.com\t/\tSession",
+                "cookie_header_control_character",
+                ("table-canary",),
+            ),
+            (
+                "duplicate names",
+                (
+                    "a1=first-canary; creator_antibot=synthetic; "
+                    "a1=second-canary; web_session=synthetic"
+                ),
+                "cookie_header_duplicate_name",
+                ("first-canary", "second-canary"),
+            ),
+            (
+                "embedded CRLF second header",
+                (
+                    "a1=crlf-canary; web_session=synthetic\r\n"
+                    "X-Injected: injection-canary"
+                ),
+                "cookie_header_control_character",
+                ("crlf-canary", "injection-canary"),
+            ),
+            (
+                "embedded newline",
+                "a1=newline-canary\nweb_session=synthetic",
+                "cookie_header_control_character",
+                ("newline-canary",),
+            ),
+            (
+                "multiple trailing newlines",
+                "a1=newlines-canary; web_session=synthetic\n\n",
+                "cookie_header_control_character",
+                ("newlines-canary",),
+            ),
+            (
+                "embedded tab",
+                "a1=tab-canary;\tweb_session=synthetic",
+                "cookie_header_control_character",
+                ("tab-canary",),
+            ),
+            (
+                "embedded null",
+                "a1=null-canary;\x00web_session=synthetic",
+                "cookie_header_control_character",
+                ("null-canary",),
+            ),
+            (
+                "invalid name",
+                "invalid name=name-canary; a1=synthetic; web_session=synthetic",
+                "cookie_header_invalid_name",
+                ("name-canary",),
+            ),
+            (
+                "missing equals",
+                "pair-canary; a1=synthetic; web_session=synthetic",
+                "cookie_header_missing_equals",
+                ("pair-canary",),
+            ),
+            (
+                "too large",
+                (
+                    "a1=size-canary; web_session="
+                    + "x" * main.MAX_COOKIE_HEADER_BYTES
+                ),
+                "cookie_header_too_large",
+                ("size-canary",),
+            ),
+            (
+                "empty string",
+                "",
+                "cookie_header_empty",
+                (),
+            ),
+            (
+                "outer spaces",
+                "   ",
+                "cookie_header_empty",
+                (),
+            ),
+            (
+                "empty labeled header",
+                " Cookie: \r\n ",
+                "cookie_header_empty",
+                (),
             ),
         )
-        self.assertNotIn("secret-value", response.text)
+        for name, submitted, code, canaries in cases:
+            with self.subTest(name=name):
+                self.assert_cookie_parse_failure(
+                    submitted,
+                    code,
+                    canaries,
+                )
 
-    def test_rejects_header_without_required_session_cookies(self):
-        response = self.client.post(
-            "/login/cookie",
-            headers=self.headers,
-            json={"cookie": "webId=browser-id; xsecappid=ugc"},
+    def test_rejects_missing_required_session_fields_with_distinct_safe_code(self):
+        response = self.assert_cookie_parse_failure(
+            "webId=browser-canary; xsecappid=ugc",
+            "cookie_required_session_fields",
+            ("browser-canary",),
         )
 
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("a1 and web_session", response.json()["detail"])
-
-    def test_rejects_duplicate_cookie_names_without_selecting_a_value(self):
-        with (
-            patch.object(main, "_new_creator_client") as new_client,
-            patch.object(main, "_validate_creator_session") as validate,
-            patch.object(main, "_save_and_swap_client") as save_and_swap,
-        ):
-            response = self.client.post(
-                "/login/cookie",
-                headers=self.headers,
-                json={
-                    "cookie": (
-                        "a1=first-synthetic; creator_antibot=synthetic; "
-                        "a1=second-synthetic; web_session=synthetic"
-                    )
-                },
-            )
-
-        self.assertEqual(response.status_code, 400)
-        new_client.assert_not_called()
-        validate.assert_not_called()
-        save_and_swap.assert_not_called()
-        self.assertNotIn("first-synthetic", response.text)
-        self.assertNotIn("second-synthetic", response.text)
+        self.assertNotIn("a1", response.text)
+        self.assertNotIn("web_session", response.text)
 
     def test_cookie_login_requires_api_key_before_parsing(self):
         response = self.client.post(
