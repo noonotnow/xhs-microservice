@@ -84,8 +84,18 @@ QR_NO_STORE_HEADERS = {
 }
 CLIENT_LOCK = threading.Lock()
 REDNOTE_CREATOR_HOST = "https://creator.rednote.com"
-REDNOTE_CREATOR_PROFILE_PATH = "/api/galaxy/creator/home/personal_info"
+REDNOTE_CREATOR_VALIDATION_PATH = "/api/media/v1/upload/web/permit"
+REDNOTE_CREATOR_VALIDATION_URI = (
+    f"{REDNOTE_CREATOR_VALIDATION_PATH}"
+    "?biz_name=spectrum&scene=image&file_count=1&version=1&source=web"
+)
 XHS_SESSION_EXPIRED_RESULT = -100
+CREATOR_SESSION_INVALID_REASONS = frozenset({
+    "redirect",
+    "http_401",
+    "http_403",
+    "api_session_expired",
+})
 UPLOAD_TOKEN_MAX_LIFETIME_SECONDS = 5 * 60
 BASE64URL_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 COOKIE_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
@@ -307,8 +317,13 @@ def _add_international_cookies(xhs_client):
         "xsecappid": "ugc",
         "webId": "3747724572cf538850bbb03b4a64d371",
     }
+    existing_names = {
+        cookie.name
+        for cookie in xhs_client.session.cookies
+    }
     for name, value in extra_cookies.items():
-        xhs_client.session.cookies.set(name, value, domain=domain)
+        if name not in existing_names:
+            xhs_client.session.cookies.set(name, value, domain=domain)
 
 
 def _save_and_swap_client(cookie: str, replacement: XhsClient):
@@ -674,81 +689,186 @@ class CreatorSessionValidation:
     valid: bool
     error_code: str | None = None
     relogin_required: bool = False
+    reason: str | None = None
+    upstream_status: int | None = None
+    upstream_code: int | None = None
 
 
-def _request_creator_profile(xhs_client: XhsClient) -> requests.Response:
+def _safe_upstream_number(value) -> int | None:
+    return value if type(value) is int else None
+
+
+def _request_creator_validation(
+    xhs_client: XhsClient,
+    cookie_header: str,
+) -> requests.Response:
+    cookies = _parse_cookie_header(cookie_header)
     signed_headers = creator_sign(
-        REDNOTE_CREATOR_PROFILE_PATH,
+        REDNOTE_CREATOR_VALIDATION_URI,
         None,
-        a1=xhs_client.cookie_dict.get("a1", ""),
+        a1=cookies.get("a1", ""),
     )
     request_headers = {
         "Accept": "application/json, text/plain, */*",
+        "Cookie": cookie_header,
         "Origin": REDNOTE_CREATOR_HOST,
         "Referer": f"{REDNOTE_CREATOR_HOST}/publish/publish",
         "User-Agent": xhs_client.user_agent,
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
         **signed_headers,
     }
-    return xhs_client.session.get(
-        f"{REDNOTE_CREATOR_HOST}{REDNOTE_CREATOR_PROFILE_PATH}",
+    prepared = requests.Request(
+        "GET",
+        f"{REDNOTE_CREATOR_HOST}{REDNOTE_CREATOR_VALIDATION_URI}",
         headers=request_headers,
-        timeout=xhs_client.timeout,
-        proxies=xhs_client.proxies,
-        allow_redirects=False,
+    ).prepare()
+    environment = xhs_client.session.merge_environment_settings(
+        prepared.url,
+        xhs_client.proxies or {},
+        stream=False,
+        verify=None,
+        cert=None,
     )
+    adapter = xhs_client.session.get_adapter(prepared.url)
+    return adapter.send(prepared, timeout=xhs_client.timeout, **environment)
 
 
 def _validate_creator_session(
     xhs_client: XhsClient,
+    cookie_header: str,
 ) -> CreatorSessionValidation:
     try:
-        response = _request_creator_profile(xhs_client)
+        response = _request_creator_validation(xhs_client, cookie_header)
     except requests.RequestException:
+        logger.warning("Creator session validation unavailable: transport")
         return CreatorSessionValidation(
             valid=False,
             error_code="creator_session_validation_unavailable",
         )
 
+    upstream_status = _safe_upstream_number(response.status_code)
     if response.is_redirect or response.is_permanent_redirect:
-        return CreatorSessionValidation(
-            valid=False,
-            error_code="creator_session_invalid",
-            relogin_required=True,
+        logger.info(
+            "Creator session invalid reason=redirect status=%s",
+            upstream_status,
         )
-    if response.status_code in {401, 403}:
         return CreatorSessionValidation(
             valid=False,
             error_code="creator_session_invalid",
             relogin_required=True,
+            reason="redirect",
+            upstream_status=upstream_status,
+        )
+    if response.status_code == 401:
+        logger.info("Creator session invalid reason=http_401 status=401")
+        return CreatorSessionValidation(
+            valid=False,
+            error_code="creator_session_invalid",
+            relogin_required=True,
+            reason="http_401",
+            upstream_status=upstream_status,
+        )
+    if response.status_code == 403:
+        logger.info("Creator session invalid reason=http_403 status=403")
+        return CreatorSessionValidation(
+            valid=False,
+            error_code="creator_session_invalid",
+            relogin_required=True,
+            reason="http_403",
+            upstream_status=upstream_status,
         )
     if not 200 <= response.status_code < 300:
+        logger.warning(
+            "Creator session validation unavailable status=%s",
+            upstream_status,
+        )
         return CreatorSessionValidation(
             valid=False,
             error_code="creator_session_validation_unavailable",
+            upstream_status=upstream_status,
         )
 
     try:
         payload = response.json()
     except requests.exceptions.JSONDecodeError:
+        logger.warning(
+            "Creator session validation unavailable status=%s",
+            upstream_status,
+        )
         return CreatorSessionValidation(
             valid=False,
             error_code="creator_session_validation_unavailable",
+            upstream_status=upstream_status,
         )
 
-    if isinstance(payload, dict) and payload.get("success") is True:
-        return CreatorSessionValidation(valid=True)
-    if isinstance(payload, dict) and (
-        payload.get("result") == XHS_SESSION_EXPIRED_RESULT
-        or payload.get("code") == XHS_SESSION_EXPIRED_RESULT
-    ):
+    upstream_code = None
+    has_usable_permit = False
+    if isinstance(payload, dict):
+        code = _safe_upstream_number(payload.get("code"))
+        result = _safe_upstream_number(payload.get("result"))
+        upstream_code = (
+            XHS_SESSION_EXPIRED_RESULT
+            if XHS_SESSION_EXPIRED_RESULT in (code, result)
+            else code if code is not None else result
+        )
+        data = payload.get("data")
+        permits = (
+            data.get("uploadTempPermits")
+            if isinstance(data, dict)
+            else None
+        )
+        if isinstance(permits, list) and permits:
+            permit = permits[0]
+            file_ids = (
+                permit.get("fileIds")
+                if isinstance(permit, dict)
+                else None
+            )
+            token = (
+                permit.get("token")
+                if isinstance(permit, dict)
+                else None
+            )
+            has_usable_permit = (
+                payload.get("success") is True
+                and code in (None, 0)
+                and result in (None, 0)
+                and isinstance(file_ids, list)
+                and bool(file_ids)
+                and isinstance(file_ids[0], str)
+                and bool(file_ids[0].strip())
+                and isinstance(token, str)
+                and bool(token.strip())
+            )
+    if upstream_code == XHS_SESSION_EXPIRED_RESULT:
+        logger.info(
+            "Creator session invalid reason=api_session_expired "
+            "status=%s code=%s",
+            upstream_status,
+            upstream_code,
+        )
         return CreatorSessionValidation(
             valid=False,
             error_code="creator_session_invalid",
             relogin_required=True,
+            reason="api_session_expired",
+            upstream_status=upstream_status,
+            upstream_code=upstream_code,
         )
+    if has_usable_permit:
+        return CreatorSessionValidation(valid=True)
+    logger.warning(
+        "Creator session validation unavailable status=%s code=%s",
+        upstream_status,
+        upstream_code,
+    )
     return CreatorSessionValidation(
         valid=False,
         error_code="creator_session_validation_unavailable",
+        upstream_status=upstream_status,
+        upstream_code=upstream_code,
     )
 
 
@@ -759,9 +879,9 @@ def _session_status_payload(
         "valid": validation.valid,
         "session_type": "rednote_creator",
         "validation": {
-            "method": "creator_profile",
+            "method": "creator_upload_permit",
             "host": "creator.rednote.com",
-            "path": REDNOTE_CREATOR_PROFILE_PATH,
+            "path": REDNOTE_CREATOR_VALIDATION_PATH,
         },
         "relogin_required": validation.relogin_required,
     }
@@ -775,6 +895,14 @@ def _session_status_payload(
             "code": validation.error_code,
             "message": message,
         }
+        if validation.reason in CREATOR_SESSION_INVALID_REASONS:
+            result["error"]["reason"] = validation.reason
+        upstream_status = _safe_upstream_number(validation.upstream_status)
+        upstream_code = _safe_upstream_number(validation.upstream_code)
+        if upstream_status is not None:
+            result["error"]["upstream_status"] = upstream_status
+        if upstream_code is not None:
+            result["error"]["upstream_code"] = upstream_code
     return result
 
 
@@ -802,7 +930,7 @@ def login_with_cookie(req: CookieLoginRequest, x_api_key: str | None = Header(No
         )
     normalized_cookie = _cookie_header_string(cookies)
     candidate = _new_creator_client(normalized_cookie)
-    validation = _validate_creator_session(candidate)
+    validation = _validate_creator_session(candidate, normalized_cookie)
     status = _session_status_payload(validation)
     if not validation.valid:
         return JSONResponse(
@@ -817,7 +945,10 @@ def login_with_cookie(req: CookieLoginRequest, x_api_key: str | None = Header(No
 @app.get("/session/status")
 def session_status(x_api_key: str | None = Header(None)):
     require_api_key(x_api_key)
-    return _session_status_payload(_validate_creator_session(get_client()))
+    active_client = get_client()
+    return _session_status_payload(
+        _validate_creator_session(active_client, active_client.cookie)
+    )
 
 
 # --- File Upload ---
