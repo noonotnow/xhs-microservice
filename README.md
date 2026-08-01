@@ -55,10 +55,17 @@ ahead. Use a separate high-entropy secret from `XHS_API_KEY`.
 
 ## QR Login Flow
 
-1. `GET /login/qr` → returns `{qr_id, code, url}`
+1. `GET /login/qr` → replaces any stale login attempt and returns
+   `{qr_id, code, url, expires_at}`
 2. Convert `url` to QR code image, scan with XHS app
 3. Poll `GET /login/status` until `code_status == 2`
 4. Session cookie is saved automatically
+
+QR creation always starts with a fresh anonymous XHS client, so an expired
+production cookie cannot prevent regeneration. Polling state, including the
+temporary login cookies required to resume after a container restart, is stored
+in `qr_state.json`. Expired or rejected QR attempts return `expired: true` and
+are removed so the next `/login/qr` call starts cleanly.
 
 ## Publishing Flow
 
