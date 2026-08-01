@@ -93,19 +93,30 @@ Requests cookie-jar domain and path filtering. Supplemental defaults never
 replace submitted cookie names. Both `a1` and `web_session` are required.
 Cookie values and names are never logged or returned.
 
+The copied Request Header may contain pairs selected by the browser from both
+`.rednote.com` and `creator.rednote.com` scopes, including host-specific
+anti-bot state. The service retains every validated pair in submitted order
+when constructing the validation request. Because a plain Cookie header does
+not carry domain/path scope, duplicate names are ambiguous and rejected rather
+than silently choosing one value. DevTools table exports remain unsupported.
+
 A submitted cookie is validated through the signed Creator upload-permit GET
-already used by publishing:
+confirmed by the authenticated browser flow:
 
 ```text
-https://creator.rednote.com/api/media/v1/upload/web/permit?biz_name=spectrum&scene=image&file_count=1&version=1&source=web
+https://creator.rednote.com/api/media/v1/upload/creator/permit?biz_name=spectrum&scene=image&file_count=1&version=1&source=web
 ```
 
 The request includes request-local signing plus browser-compatible Origin,
 Referer, User-Agent, Accept, and Sec-Fetch headers. Validation does not mutate
-the candidate or active session headers or cookie jar. Only a successful
-response containing a usable file ID and upload token is persisted and
-installed; there is no fallback acceptance. A failed replacement leaves the
-prior cookie file and active publishing client intact.
+the candidate or active session headers or cookie jar. Only a response
+containing a non-empty file ID and upload token plus unambiguous success
+metadata is persisted and installed. Supported success metadata is the Creator
+contract's top-level `success: true` with `code: 0`, its nested
+`data.result.success: true`, or both when they agree. Conflicting, partial, or
+malformed success indicators are rejected; there is no fallback acceptance. A
+failed replacement leaves the prior cookie file and active publishing client
+intact.
 
 Redirects, HTTP 401/403, and XHS session-expired result `-100` return HTTP 401
 with `creator_session_invalid`, `relogin_required: true`, and a sanitized
@@ -116,8 +127,8 @@ Transport failures, 5xx responses, malformed payloads, and unexpected success
 shapes return sanitized HTTP 502 `creator_session_validation_unavailable`
 without replacing the session.
 
-`GET /session/status` uses the same Creator profile boundary and returns stable
-sanitized metadata without forwarding the profile payload:
+`GET /session/status` uses the same Creator upload-permit boundary and returns
+stable sanitized metadata without forwarding the permit payload:
 
 ```json
 {
@@ -126,11 +137,17 @@ sanitized metadata without forwarding the profile payload:
   "validation": {
     "method": "creator_upload_permit",
     "host": "creator.rednote.com",
-    "path": "/api/media/v1/upload/web/permit"
+    "path": "/api/media/v1/upload/creator/permit",
+    "source": "active_session"
   },
   "relogin_required": false
 }
 ```
+
+`POST /login/cookie` reports `validation.source` as
+`cookie_login_candidate`, while `GET /session/status` reports
+`active_session`. This static provenance identifies which session was checked
+without exposing cookies, upload credentials, response bodies, or headers.
 
 ## Publishing Flow
 
@@ -202,7 +219,8 @@ XHS_API_KEY=test UPLOAD_TOKEN_SECRET=upload-test-secret DATA_DIR=./data UPLOAD_D
 ## Important Notes
 
 - **Playwright/Chromium is required** for request signing (XHS anti-bot)
-- **Session expires** — if `/session/status` returns `{valid: false}`, re-do QR login
+- **Session expires** — if `/session/status` returns `{valid: false}`, submit a
+  fresh Creator request cookie through `/login/cookie`
 - **Images must be local files** — upload via `/upload` first, then pass paths to `/publish`
 - **Topics** — pass keyword strings in `topic_keywords`, the service looks up proper topic objects
 

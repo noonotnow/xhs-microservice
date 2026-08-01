@@ -1,10 +1,12 @@
 import asyncio
+import io
 import json
 import os
 import sys
 import tempfile
 import types
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -103,6 +105,85 @@ class CreatorQRProtocolTests(unittest.TestCase):
         )
 
 
+class DebugPermitProbeSecurityTests(unittest.TestCase):
+    def test_publish_steps_never_calls_or_echoes_permit_probes(self):
+        permit_token = "synthetic-permit-token-canary"
+        permit_file_id = "synthetic-permit-file-id-canary"
+        raw_payload = "synthetic-raw-payload-canary"
+        upstream_header = "synthetic-upstream-header-canary"
+        cookie_value = "synthetic-cookie-canary"
+
+        class FakeClient:
+            cookie_dict = {"a1": cookie_value}
+
+            def __init__(self):
+                self.get_calls = []
+
+            def get_self_info(self):
+                return {}
+
+            def get(self, uri, *args, **kwargs):
+                self.get_calls.append(uri)
+                if "permit" in uri:
+                    payload = {
+                        "uploadTempPermits": [
+                            {
+                                "token": permit_token,
+                                "fileIds": [permit_file_id],
+                            }
+                        ],
+                        "raw": raw_payload,
+                        "headers": {"X-Synthetic": upstream_header},
+                        "cookie": cookie_value,
+                    }
+                    print(payload)
+                    return payload
+                return {}
+
+            def get_suggest_topic(self, keyword):
+                return []
+
+        fake_client = FakeClient()
+        stdout = io.StringIO()
+        with (
+            patch.object(main, "get_client", return_value=fake_client),
+            patch(
+                "sign_service.sign",
+                return_value={
+                    "x-s": "synthetic-signature",
+                    "x-s-common": "synthetic-common",
+                },
+            ),
+            patch.object(main.logger, "info") as log_info,
+            patch.object(main.logger, "warning") as log_warning,
+            patch.object(main.logger, "error") as log_error,
+            redirect_stdout(stdout),
+        ):
+            response = TestClient(main.app).get(
+                "/debug/publish-steps",
+                headers={"X-Api-Key": main.API_KEY},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("2_upload_permit", response.json())
+        self.assertNotIn("2b_creator_upload_permit", response.json())
+        self.assertFalse(
+            any("permit" in uri for uri in fake_client.get_calls)
+        )
+        log_info.assert_not_called()
+        log_warning.assert_not_called()
+        log_error.assert_not_called()
+        output = " ".join((response.text, stdout.getvalue()))
+        for canary in (
+            permit_token,
+            permit_file_id,
+            raw_payload,
+            upstream_header,
+            cookie_value,
+        ):
+            self.assertNotIn(canary, output)
+
+
 class CookieLoginRouteTests(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(main.app)
@@ -114,6 +195,11 @@ class CookieLoginRouteTests(unittest.TestCase):
 
     def test_accepts_only_creator_valid_cookie_and_preserves_equals_in_value(self):
         candidate = object()
+        submitted_cookie = (
+            "creator_antibot=host-scoped-synthetic; "
+            "a1=fresh-a1; domain_state=domain-scoped-synthetic; "
+            "web_session=session-with-padding==; webId=browser-id"
+        )
         with (
             patch.object(
                 main,
@@ -124,26 +210,84 @@ class CookieLoginRouteTests(unittest.TestCase):
                 main,
                 "_validate_creator_session",
                 return_value=main.CreatorSessionValidation(valid=True),
-            ),
+            ) as validate,
             patch.object(main, "_save_and_swap_client") as save_and_swap,
         ):
             response = self.client.post(
                 "/login/cookie",
                 headers=self.headers,
-                json={
-                    "cookie": (
-                        "a1=fresh-a1; web_session=session-with-padding==; "
-                        "webId=browser-id"
-                    )
-                },
+                json={"cookie": submitted_cookie},
             )
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["valid"], True)
+        validate.assert_called_once_with(candidate, submitted_cookie)
+        save_and_swap.assert_called_once_with(submitted_cookie, candidate)
+        for cookie_value in (
+            "host-scoped-synthetic",
+            "domain-scoped-synthetic",
+            "fresh-a1",
+            "session-with-padding==",
+        ):
+            self.assertNotIn(cookie_value, response.text)
+
+    def test_nested_creator_permit_response_returns_only_sanitized_status(self):
+        candidate = object()
+        permit_token = "synthetic-placeholder-token"
+        permit_file_id = "synthetic-placeholder-file-id"
+        upstream_response = types.SimpleNamespace(
+            is_redirect=False,
+            is_permanent_redirect=False,
+            status_code=200,
+            json=lambda: {
+                "success": True,
+                "code": 0,
+                "data": {
+                    "result": {"success": True},
+                    "uploadTempPermits": [
+                        {
+                            "token": permit_token,
+                            "fileIds": [permit_file_id],
+                        }
+                    ],
+                },
+            },
+        )
+        with (
+            patch.object(
+                main,
+                "_new_creator_client",
+                return_value=candidate,
+            ),
+            patch.object(
+                main,
+                "_request_creator_validation",
+                return_value=upstream_response,
+            ),
+            patch.object(main, "_save_and_swap_client") as save_and_swap,
+            patch.object(main.logger, "info") as log_info,
+            patch.object(main.logger, "warning") as log_warning,
+        ):
+            response = self.client.post(
+                "/login/cookie",
+                headers=self.headers,
+                json={"cookie": "a1=synthetic; web_session=synthetic"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["valid"])
+        self.assertEqual(
+            response.json()["validation"]["source"],
+            "cookie_login_candidate",
+        )
         save_and_swap.assert_called_once_with(
-            "a1=fresh-a1; web_session=session-with-padding==; webId=browser-id",
+            "a1=synthetic; web_session=synthetic",
             candidate,
         )
+        log_info.assert_not_called()
+        log_warning.assert_not_called()
+        for permit_value in (permit_token, permit_file_id):
+            self.assertNotIn(permit_value, response.text)
 
     def test_rejects_devtools_table_export_without_echoing_input(self):
         response = self.client.post(
@@ -176,6 +320,30 @@ class CookieLoginRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertIn("a1 and web_session", response.json()["detail"])
+
+    def test_rejects_duplicate_cookie_names_without_selecting_a_value(self):
+        with (
+            patch.object(main, "_new_creator_client") as new_client,
+            patch.object(main, "_validate_creator_session") as validate,
+            patch.object(main, "_save_and_swap_client") as save_and_swap,
+        ):
+            response = self.client.post(
+                "/login/cookie",
+                headers=self.headers,
+                json={
+                    "cookie": (
+                        "a1=first-synthetic; creator_antibot=synthetic; "
+                        "a1=second-synthetic; web_session=synthetic"
+                    )
+                },
+            )
+
+        self.assertEqual(response.status_code, 400)
+        new_client.assert_not_called()
+        validate.assert_not_called()
+        save_and_swap.assert_not_called()
+        self.assertNotIn("first-synthetic", response.text)
+        self.assertNotIn("second-synthetic", response.text)
 
     def test_cookie_login_requires_api_key_before_parsing(self):
         response = self.client.post(
@@ -265,6 +433,84 @@ class CookieLoginRouteTests(unittest.TestCase):
         self.assertIs(main.client, working_client)
         self.assertNotIn("new-secret", response.text)
         self.assertNotIn("new-session", response.text)
+
+    def test_conflicting_candidate_response_preserves_prior_session_atomically(self):
+        working_client = object()
+        candidate = object()
+        main.client = working_client
+        upstream_marker = "synthetic-upstream-marker"
+        response_payload = {
+            "success": True,
+            "code": 0,
+            "data": {
+                "result": {"success": False},
+                "uploadTempPermits": [
+                    {
+                        "fileIds": ["synthetic-placeholder-file-id"],
+                        "token": upstream_marker,
+                    }
+                ],
+            },
+        }
+        upstream_response = types.SimpleNamespace(
+            is_redirect=False,
+            is_permanent_redirect=False,
+            status_code=200,
+            json=lambda: response_payload,
+        )
+        with tempfile.TemporaryDirectory() as data_dir:
+            cookie_file = os.path.join(data_dir, "cookie.json")
+            with (
+                patch.object(main, "DATA_DIR", data_dir),
+                patch.object(main, "COOKIE_FILE", cookie_file),
+                patch.object(
+                    main,
+                    "_new_creator_client",
+                    return_value=candidate,
+                ),
+                patch.object(
+                    main,
+                    "_request_creator_validation",
+                    return_value=upstream_response,
+                ),
+                patch.object(main, "_save_and_swap_client") as save_and_swap,
+                self.assertLogs(main.logger, level="WARNING") as captured,
+            ):
+                main.save_cookie(
+                    "a1=prior-synthetic; web_session=prior-synthetic"
+                )
+                response = self.client.post(
+                    "/login/cookie",
+                    headers=self.headers,
+                    json={
+                        "cookie": (
+                            "a1=candidate-synthetic; "
+                            "web_session=candidate-synthetic"
+                        )
+                    },
+                )
+
+            self.assertEqual(response.status_code, 502)
+            self.assertEqual(
+                response.json()["validation"]["source"],
+                "cookie_login_candidate",
+            )
+            self.assertEqual(
+                json.loads(Path(cookie_file).read_text())["cookie"],
+                "a1=prior-synthetic; web_session=prior-synthetic",
+            )
+            self.assertIs(main.client, working_client)
+            save_and_swap.assert_not_called()
+            response_text = response.text
+            log_text = " ".join(captured.output)
+            for marker in (
+                upstream_marker,
+                "synthetic-placeholder-file-id",
+                "candidate-synthetic",
+                "prior-synthetic",
+            ):
+                self.assertNotIn(marker, response_text)
+                self.assertNotIn(marker, log_text)
 
     def test_failed_validation_preserves_cookie_file_and_active_client_atomically(self):
         working_client = object()
@@ -396,7 +642,7 @@ class CookieLoginRouteTests(unittest.TestCase):
                 main,
                 "_validate_creator_session",
                 return_value=validation,
-            ),
+            ) as validate,
             patch.object(main, "get_client", return_value=candidate),
             patch.object(main, "_save_and_swap_client") as save_and_swap,
         ):
@@ -414,13 +660,28 @@ class CookieLoginRouteTests(unittest.TestCase):
         for key in (
             "valid",
             "session_type",
-            "validation",
             "relogin_required",
         ):
             self.assertEqual(
                 login_response.json()[key],
                 status_response.json()[key],
             )
+        login_metadata = login_response.json()["validation"]
+        status_metadata = status_response.json()["validation"]
+        for key in ("method", "host", "path"):
+            self.assertEqual(login_metadata[key], status_metadata[key])
+        self.assertEqual(
+            login_metadata["source"],
+            "cookie_login_candidate",
+        )
+        self.assertEqual(status_metadata["source"], "active_session")
+        self.assertEqual(
+            validate.call_args_list,
+            [
+                unittest.mock.call(candidate, "a1=fresh; web_session=fresh"),
+                unittest.mock.call(candidate, candidate.cookie),
+            ],
+        )
 
     def test_saved_cookie_file_is_private_and_old_file_is_tightened(self):
         with tempfile.TemporaryDirectory() as data_dir:
@@ -464,9 +725,16 @@ class CreatorSessionValidationTests(unittest.TestCase):
                     200,
                     {
                         "success": True,
+                        "code": 0,
                         "data": {
+                            "result": {"success": True},
                             "uploadTempPermits": [
-                                {"fileIds": ["file-id"], "token": "token"}
+                                {
+                                    "fileIds": [
+                                        "synthetic-placeholder-file-id"
+                                    ],
+                                    "token": "synthetic-placeholder-token",
+                                }
                             ]
                         },
                     },
@@ -479,8 +747,14 @@ class CreatorSessionValidationTests(unittest.TestCase):
                 pass
 
         cookie_header = (
-            "a1=signing-cookie; web_session=authenticated-session; "
+            "creator_antibot=host-scoped-synthetic; "
+            "a1=signing-cookie; domain_state=domain-scoped-synthetic; "
+            "web_session=authenticated-session; "
             "webId=submitted-browser; path_scoped=submitted-value"
+        )
+        self.assertEqual(
+            main._cookie_header_string(main._parse_cookie_header(cookie_header)),
+            cookie_header,
         )
         candidate = main._new_creator_client(cookie_header)
         candidate.session.cookies.clear()
@@ -504,34 +778,54 @@ class CreatorSessionValidationTests(unittest.TestCase):
         ]
         adapter = RecordingAdapter()
         candidate.session.mount("https://", adapter)
-        with patch.object(
-            main,
-            "creator_sign",
-            return_value={
-                "x-s": "signed",
-                "x-t": "time",
-                "x-s-common": "common",
-            },
-        ) as creator_sign:
+        with (
+            patch.object(
+                main,
+                "creator_sign",
+                return_value={
+                    "x-s": "signed",
+                    "x-t": "time",
+                    "x-s-common": "common",
+                },
+            ) as creator_sign,
+            patch.object(main.logger, "info") as log_info,
+            patch.object(main.logger, "warning") as log_warning,
+        ):
             validation = main._validate_creator_session(
                 candidate,
                 cookie_header,
             )
 
         self.assertEqual(validation, main.CreatorSessionValidation(valid=True))
+        expected_path = "/api/media/v1/upload/creator/permit"
+        expected_uri = (
+            f"{expected_path}"
+            "?biz_name=spectrum&scene=image&file_count=1&version=1&source=web"
+        )
+        self.assertEqual(main.REDNOTE_CREATOR_VALIDATION_PATH, expected_path)
+        self.assertEqual(main.REDNOTE_CREATOR_VALIDATION_URI, expected_uri)
         creator_sign.assert_called_once_with(
-            main.REDNOTE_CREATOR_VALIDATION_URI,
+            expected_uri,
             None,
             a1="signing-cookie",
         )
         request, request_kwargs = adapter.requests[0]
         self.assertEqual(
             request.url,
-            f"{main.REDNOTE_CREATOR_HOST}{main.REDNOTE_CREATOR_VALIDATION_URI}",
+            f"https://creator.rednote.com{expected_uri}",
         )
         self.assertEqual(request.method, "GET")
         self.assertEqual(request.headers["Cookie"], cookie_header)
         self.assertNotIn("jar-only", request.headers["Cookie"])
+        log_info.assert_not_called()
+        log_warning.assert_not_called()
+        for cookie_value in (
+            "host-scoped-synthetic",
+            "domain-scoped-synthetic",
+            "signing-cookie",
+            "authenticated-session",
+        ):
+            self.assertNotIn(cookie_value, repr(validation))
         self.assertEqual(request.headers["Origin"], main.REDNOTE_CREATOR_HOST)
         self.assertEqual(
             request.headers["Referer"],
@@ -557,6 +851,150 @@ class CreatorSessionValidationTests(unittest.TestCase):
             ],
             original_cookies,
         )
+
+    def test_accepts_observed_nested_permit_success_shape(self):
+        response = self._response(
+            200,
+            {
+                "success": True,
+                "code": 0,
+                "data": {
+                    "result": {"success": True},
+                    "uploadTempPermits": [
+                        {
+                            "token": "synthetic-placeholder-token",
+                            "fileIds": ["synthetic-placeholder-file-id"],
+                        }
+                    ],
+                },
+            },
+        )
+        with patch.object(
+            main,
+            "_request_creator_validation",
+            return_value=response,
+        ):
+            validation = main._validate_creator_session(
+                object(),
+                "a1=synthetic; web_session=synthetic",
+            )
+
+        self.assertEqual(validation, main.CreatorSessionValidation(valid=True))
+
+    def test_accepts_nested_success_contract_without_top_level_signals(self):
+        response = self._response(
+            200,
+            {
+                "data": {
+                    "result": {"success": True},
+                    "uploadTempPermits": [
+                        {
+                            "token": "synthetic-placeholder-token",
+                            "fileIds": ["synthetic-placeholder-file-id"],
+                        }
+                    ],
+                },
+            },
+        )
+        with patch.object(
+            main,
+            "_request_creator_validation",
+            return_value=response,
+        ):
+            validation = main._validate_creator_session(
+                object(),
+                "a1=synthetic; web_session=synthetic",
+            )
+
+        self.assertEqual(validation, main.CreatorSessionValidation(valid=True))
+
+    def test_accepts_top_level_success_contract_without_nested_result(self):
+        response = self._response(
+            200,
+            {
+                "success": True,
+                "code": 0,
+                "data": {
+                    "uploadTempPermits": [
+                        {
+                            "token": "synthetic-placeholder-token",
+                            "fileIds": ["synthetic-placeholder-file-id"],
+                        }
+                    ],
+                },
+            },
+        )
+        with patch.object(
+            main,
+            "_request_creator_validation",
+            return_value=response,
+        ):
+            validation = main._validate_creator_session(
+                object(),
+                "a1=synthetic; web_session=synthetic",
+            )
+
+        self.assertEqual(validation, main.CreatorSessionValidation(valid=True))
+
+    def test_rejects_conflicting_partial_and_malformed_success_signals(self):
+        permit_data = {
+            "uploadTempPermits": [
+                {
+                    "token": "synthetic-placeholder-token",
+                    "fileIds": ["synthetic-placeholder-file-id"],
+                }
+            ],
+        }
+        payloads = (
+            {
+                "success": True,
+                "code": 0,
+                "data": {**permit_data, "result": {"success": False}},
+            },
+            {
+                "success": False,
+                "code": 0,
+                "data": {**permit_data, "result": {"success": True}},
+            },
+            {
+                "success": True,
+                "code": 1,
+                "data": {**permit_data, "result": {"success": True}},
+            },
+            {"success": True, "data": permit_data},
+            {"code": 0, "data": permit_data},
+            {
+                "success": True,
+                "code": 0,
+                "data": {**permit_data, "result": {"success": "true"}},
+            },
+            {
+                "success": True,
+                "code": 0,
+                "result": {"success": True},
+                "data": permit_data,
+            },
+        )
+        for payload in payloads:
+            with (
+                self.subTest(payload=payload),
+                patch.object(
+                    main,
+                    "_request_creator_validation",
+                    return_value=self._response(200, payload),
+                ),
+            ):
+                validation = main._validate_creator_session(
+                    object(),
+                    "a1=synthetic; web_session=synthetic",
+                )
+
+            self.assertFalse(validation.valid)
+            self.assertEqual(
+                validation.error_code,
+                "creator_session_validation_unavailable",
+            )
+            self.assertFalse(validation.relogin_required)
 
     def test_submitted_cookie_values_are_not_replaced_by_supplemental_defaults(self):
         candidate = main._new_creator_client(
@@ -633,7 +1071,7 @@ class CreatorSessionValidationTests(unittest.TestCase):
                     upstream_status=status,
                 ),
             )
-            payload = main._session_status_payload(validation)
+            payload = main._session_status_payload(validation, "active_session")
             self.assertEqual(payload["error"]["reason"], reason)
             self.assertEqual(payload["error"]["upstream_status"], status)
             self.assertNotIn("secret.example", json.dumps(payload))
@@ -684,7 +1122,9 @@ class CreatorSessionValidationTests(unittest.TestCase):
                 upstream_code=-100,
             ),
         )
-        payload_text = json.dumps(main._session_status_payload(validation))
+        payload_text = json.dumps(
+            main._session_status_payload(validation, "active_session")
+        )
         log_text = " ".join(captured.output)
         for secret in (
             "raw-upstream-secret",
@@ -707,7 +1147,8 @@ class CreatorSessionValidationTests(unittest.TestCase):
                 reason="raw-upstream-secret",
                 upstream_status="401",
                 upstream_code={"secret": "value"},
-            )
+            ),
+            "active_session",
         )
 
         self.assertEqual(
@@ -828,7 +1269,9 @@ class CreatorSessionValidationTests(unittest.TestCase):
                 validation.upstream_status,
                 response.status_code,
             )
-            payload_text = json.dumps(main._session_status_payload(validation))
+            payload_text = json.dumps(
+                main._session_status_payload(validation, "active_session")
+            )
             self.assertNotIn("raw-secret", payload_text)
             self.assertNotIn("secret-a1", payload_text)
             self.assertNotIn("secret-session", payload_text)
