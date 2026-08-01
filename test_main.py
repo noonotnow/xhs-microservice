@@ -225,6 +225,43 @@ class CookieLoginRouteTests(unittest.TestCase):
         self.assertNotIn("new-secret", response.text)
         self.assertNotIn("new-session", response.text)
 
+    def test_validation_unavailable_does_not_persist_or_replace_working_client(self):
+        working_client = object()
+        candidate = object()
+        main.client = working_client
+        validation = main.CreatorSessionValidation(
+            valid=False,
+            error_code="creator_session_validation_unavailable",
+        )
+        with (
+            patch.object(
+                main,
+                "_new_creator_client",
+                return_value=candidate,
+            ),
+            patch.object(
+                main,
+                "_validate_creator_session",
+                return_value=validation,
+            ),
+            patch.object(main, "_save_and_swap_client") as save_and_swap,
+        ):
+            response = self.client.post(
+                "/login/cookie",
+                headers=self.headers,
+                json={"cookie": "a1=new-secret; web_session=new-session"},
+            )
+
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(
+            response.json()["error"]["code"],
+            "creator_session_validation_unavailable",
+        )
+        save_and_swap.assert_not_called()
+        self.assertIs(main.client, working_client)
+        self.assertNotIn("new-secret", response.text)
+        self.assertNotIn("new-session", response.text)
+
     def test_session_failure_does_not_return_upstream_payload(self):
         upstream_error = "cookie=must-not-escape"
         response_payload = {
@@ -319,50 +356,85 @@ class CookieLoginRouteTests(unittest.TestCase):
 
 
 class CreatorSessionValidationTests(unittest.TestCase):
-    def test_uses_signed_creator_profile_without_legacy_self_check(self):
-        response = types.SimpleNamespace(
-            is_redirect=False,
-            is_permanent_redirect=False,
-            status_code=200,
-            json=lambda: {"success": True, "data": {"name": "creator"}},
-        )
-
-        class Session:
+    def test_uses_creator_request_contract_with_browser_headers_and_cookies(self):
+        class RecordingAdapter(main.requests.adapters.BaseAdapter):
             def __init__(self):
-                self.calls = []
+                self.requests = []
 
-            def get(self, url, **kwargs):
-                self.calls.append((url, kwargs))
+            def send(self, request, **kwargs):
+                self.requests.append((request, kwargs))
+                response = main.requests.Response()
+                response.status_code = 200
+                response.headers["Content-Type"] = "application/json"
+                response._content = (
+                    b'{"success": true, "data": {"name": "creator"}}'
+                )
+                response.request = request
                 return response
 
-        session = Session()
-        candidate = types.SimpleNamespace(
-            cookie_dict={"a1": "signing-cookie"},
-            session=session,
-            timeout=10,
-            proxies=None,
-            get_self_info=lambda: self.fail("legacy self check was used"),
+            def close(self):
+                pass
+
+        candidate = main._new_creator_client(
+            "a1=signing-cookie; web_session=authenticated-session"
         )
-        with patch.object(
-            main,
-            "creator_sign",
-            return_value={"x-s": "signed", "x-t": "time", "x-s-common": "common"},
-        ) as creator_sign:
+        adapter = RecordingAdapter()
+        candidate.session.mount("https://", adapter)
+        with (
+            patch.object(
+                candidate.session,
+                "get",
+                wraps=candidate.session.get,
+            ) as session_get,
+            patch.object(
+                main,
+                "creator_sign",
+                return_value={
+                    "x-s": "signed",
+                    "x-t": "time",
+                    "x-s-common": "common",
+                },
+            ) as creator_sign,
+        ):
             validation = main._validate_creator_session(candidate)
 
         self.assertEqual(validation, main.CreatorSessionValidation(valid=True))
         creator_sign.assert_called_once_with(
             main.REDNOTE_CREATOR_PROFILE_PATH,
+            None,
             a1="signing-cookie",
         )
+        request, request_kwargs = adapter.requests[0]
         self.assertEqual(
-            session.calls[0][0],
+            request.url,
             (
                 "https://creator.rednote.com"
                 "/api/galaxy/creator/home/personal_info"
             ),
         )
-        self.assertEqual(session.calls[0][1]["allow_redirects"], False)
+        self.assertEqual(request.headers["Origin"], main.REDNOTE_CREATOR_HOST)
+        self.assertEqual(
+            request.headers["Referer"],
+            f"{main.REDNOTE_CREATOR_HOST}/publish/publish",
+        )
+        self.assertIn("Mozilla/5.0", request.headers["User-Agent"])
+        self.assertEqual(
+            request.headers["Accept"],
+            "application/json, text/plain, */*",
+        )
+        self.assertEqual(request.headers["x-s"], "signed")
+        self.assertEqual(request.headers["x-t"], "time")
+        self.assertEqual(request.headers["x-s-common"], "common")
+        self.assertNotIn("x-s", candidate.session.headers)
+        self.assertNotIn("x-t", candidate.session.headers)
+        self.assertNotIn("x-s-common", candidate.session.headers)
+        self.assertIn("a1=signing-cookie", request.headers["Cookie"])
+        self.assertIn(
+            "web_session=authenticated-session",
+            request.headers["Cookie"],
+        )
+        self.assertEqual(request_kwargs["timeout"], candidate.timeout)
+        self.assertFalse(session_get.call_args.kwargs["allow_redirects"])
 
     def test_login_redirect_is_classified_as_relogin_required(self):
         redirect = types.SimpleNamespace(
@@ -383,6 +455,55 @@ class CreatorSessionValidationTests(unittest.TestCase):
                 valid=False,
                 error_code="creator_session_invalid",
                 relogin_required=True,
+            ),
+        )
+
+    def test_server_and_unexpected_responses_are_not_false_invalids(self):
+        responses = (
+            types.SimpleNamespace(
+                is_redirect=False,
+                is_permanent_redirect=False,
+                status_code=503,
+            ),
+            types.SimpleNamespace(
+                is_redirect=False,
+                is_permanent_redirect=False,
+                status_code=200,
+                json=lambda: {"success": False, "code": -1},
+            ),
+        )
+        for response in responses:
+            with (
+                self.subTest(status_code=response.status_code),
+                patch.object(
+                    main,
+                    "_request_creator_profile",
+                    return_value=response,
+                ),
+            ):
+                validation = main._validate_creator_session(object())
+
+            self.assertEqual(
+                validation,
+                main.CreatorSessionValidation(
+                    valid=False,
+                    error_code="creator_session_validation_unavailable",
+                ),
+            )
+
+    def test_transport_failure_is_validation_unavailable(self):
+        with patch.object(
+            main,
+            "_request_creator_profile",
+            side_effect=main.requests.ConnectionError("upstream unavailable"),
+        ):
+            validation = main._validate_creator_session(object())
+
+        self.assertEqual(
+            validation,
+            main.CreatorSessionValidation(
+                valid=False,
+                error_code="creator_session_validation_unavailable",
             ),
         )
 

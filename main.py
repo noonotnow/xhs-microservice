@@ -258,6 +258,7 @@ def _new_creator_client(cookie: str | None = None) -> XhsClient:
     xhs_client._creator_host = REDNOTE_CREATOR_HOST
     xhs_client.home = REDNOTE_CREATOR_HOST
     xhs_client.session.headers.update({
+        "Accept": "application/json, text/plain, */*",
         "Origin": REDNOTE_CREATOR_HOST,
         "Referer": f"{REDNOTE_CREATOR_HOST}/publish/publish",
     })
@@ -678,11 +679,19 @@ class CreatorSessionValidation:
 def _request_creator_profile(xhs_client: XhsClient) -> requests.Response:
     signed_headers = creator_sign(
         REDNOTE_CREATOR_PROFILE_PATH,
+        None,
         a1=xhs_client.cookie_dict.get("a1", ""),
     )
+    request_headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Origin": REDNOTE_CREATOR_HOST,
+        "Referer": f"{REDNOTE_CREATOR_HOST}/publish/publish",
+        "User-Agent": xhs_client.user_agent,
+        **signed_headers,
+    }
     return xhs_client.session.get(
         f"{REDNOTE_CREATOR_HOST}{REDNOTE_CREATOR_PROFILE_PATH}",
-        headers=signed_headers,
+        headers=request_headers,
         timeout=xhs_client.timeout,
         proxies=xhs_client.proxies,
         allow_redirects=False,
