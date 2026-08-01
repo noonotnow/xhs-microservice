@@ -91,8 +91,10 @@ columns are rejected. Cookies copied from a fresh authenticated
 name/value pairs directly, so they do not have to originate from a
 `xiaohongshu.com` domain. Both `a1` and `web_session` are required. Cookie
 values are never logged or returned, and invalid-session responses are
-sanitized. A submitted cookie is first validated with the read-only signed
-Creator profile request
+sanitized. A submitted cookie is first validated through the same signed
+Creator request path used by publishing, including the authenticated session
+cookies and browser-compatible Origin, Referer, User-Agent, and Accept headers.
+The read-only profile request is
 `GET https://creator.rednote.com/api/galaxy/creator/home/personal_info`.
 Only a successful Creator response is persisted and installed; a failed
 replacement leaves the prior cookie file and active publishing client intact.
