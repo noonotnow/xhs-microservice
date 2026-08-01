@@ -335,10 +335,15 @@ class QRLoginRouteTests(unittest.TestCase):
         ):
             response = self.client.get("/login/qr", headers=self.headers)
 
-        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.status_code, 503)
         self.assertEqual(
-            response.json(),
-            {"detail": "Could not generate XHS QR code"},
+            response.json()["detail"],
+            (
+                "XHS returned a merchant/Qianfan QR target, which is not "
+                "supported for Rednote creator login. Use manual cookie "
+                "login with a fresh Cookie request-header value from "
+                "https://creator.rednote.com/login."
+            ),
         )
         self.assertNotIn("xymerchant", response.text)
         self.assertFalse(os.path.exists(main.QR_STATE_FILE))

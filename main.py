@@ -352,6 +352,10 @@ class XhsLoginProtocolError(Exception):
         self.code = code
 
 
+class UnsupportedCreatorQRTargetError(Exception):
+    pass
+
+
 def _login_request(
     xhs_client: XhsClient,
     method: str,
@@ -935,7 +939,7 @@ def get_qr(x_api_key: str | None = Header(None)):
                 ):
                     raise ValueError("XHS returned incomplete QR data")
                 if not _is_supported_creator_qr_url(candidate_qr["url"]):
-                    raise ValueError("XHS returned a non-creator QR target")
+                    raise UnsupportedCreatorQRTargetError()
                 now = int(time.time())
                 candidate_expiry = _creator_qr_expires_at(candidate_qr, now)
                 if (
@@ -958,6 +962,17 @@ def get_qr(x_api_key: str | None = Header(None)):
                 "login_cookie": login_client.cookie,
                 "expires_at": expires_at,
             })
+        except UnsupportedCreatorQRTargetError as exc:
+            _clear_qr_state()
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "XHS returned a merchant/Qianfan QR target, which is not "
+                    "supported for Rednote creator login. Use manual cookie "
+                    "login with a fresh Cookie request-header value from "
+                    "https://creator.rednote.com/login."
+                ),
+            ) from exc
         except XhsLoginProtocolError as exc:
             logger.warning(
                 "XHS Creator QR generation rejected with code %s",

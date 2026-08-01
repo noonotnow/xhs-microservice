@@ -93,6 +93,11 @@ an authenticated browser request's `Cookie` header:
 {"cookie": "a1=<value>; web_session=<value>; id_token=<value>"}
 ```
 
+If any QR response targets merchant/Qianfan instead of the normal Rednote app,
+the service refuses to return it with a structured 503 directing the operator
+to manual cookie login at the official normal-account URL,
+`https://creator.rednote.com/login`.
+
 Do not paste a DevTools cookie table export; domain, path, expiry, and other
 columns are rejected. Cookies copied from a fresh authenticated
 `creator.rednote.com` request are supported: the client receives the name/value
