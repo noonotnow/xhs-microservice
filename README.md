@@ -96,9 +96,10 @@ an authenticated browser request's `Cookie` header:
 Do not paste a DevTools cookie table export; domain, path, expiry, and other
 columns are rejected. Cookies copied from a fresh authenticated
 `creator.rednote.com` request are supported: the client receives the name/value
-pairs directly and preserves values such as `id_token`. Both `a1` and
-`web_session` are required. Cookie values are never logged or returned, and
-invalid-session responses are sanitized.
+pairs directly and preserves values such as `id_token`; they do not have to
+originate from a `xiaohongshu.com` domain. Both `a1` and `web_session` are
+required. Cookie values are never logged or returned, and invalid-session
+responses are sanitized.
 
 ## Publishing Flow
 

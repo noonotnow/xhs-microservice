@@ -331,19 +331,11 @@ def get_login_client(cookie: str | None = None) -> XhsClient:
     """Create a client using xiaohongshu.com for QR login.
     QR login must go through xiaohongshu.com — the resulting cookies
     work cross-domain against rnote.com APIs."""
-    login_client = XhsClient(sign=sign)
-    login_client.session.cookies.clear()
     if cookie:
-        cookie_dict = {}
-        for block in cookie.split(";"):
-            if not block.strip() or "=" not in block:
-                continue
-            name, value = block.split("=", 1)
-            cookie_dict[name.strip()] = value.strip()
-        if not cookie_dict:
-            raise ValueError("Persisted QR cookie is invalid")
-        login_client.session.cookies.update(cookie_dict)
+        login_client = _new_xhs_client(cookie)
     else:
+        login_client = XhsClient(sign=sign)
+        login_client.session.cookies.clear()
         a1, web_id = get_a1_and_web_id()
         login_client.session.cookies.update({
             "a1": a1,

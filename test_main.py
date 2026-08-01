@@ -485,26 +485,17 @@ class CreatorQRProtocolTests(unittest.TestCase):
         })
 
     def test_resumed_login_client_restores_only_persisted_cookies(self):
-        fake_client = types.SimpleNamespace(
-            session=types.SimpleNamespace(
-                cookies=types.SimpleNamespace(
-                    clear=unittest.mock.Mock(),
-                    update=unittest.mock.Mock(),
-                )
-            )
-        )
-        with patch.object(main, "XhsClient", return_value=fake_client):
-            result = main.get_login_client(
-                "a1=fresh-a1; webId=fresh-id; acw_tc=padded=="
-            )
+        fake_client = types.SimpleNamespace()
+        cookie = "a1=fresh-a1; webId=fresh-id; acw_tc=padded=="
+        with patch.object(
+            main,
+            "_new_xhs_client",
+            return_value=fake_client,
+        ) as new_xhs_client:
+            result = main.get_login_client(cookie)
 
         self.assertIs(result, fake_client)
-        fake_client.session.cookies.clear.assert_called_once_with()
-        fake_client.session.cookies.update.assert_called_once_with({
-            "a1": "fresh-a1",
-            "webId": "fresh-id",
-            "acw_tc": "padded==",
-        })
+        new_xhs_client.assert_called_once_with(cookie)
 
     def test_health_reports_deployed_revision(self):
         with patch.object(main, "APP_REVISION", "commit-sha"):
@@ -677,16 +668,16 @@ class CookieLoginRouteTests(unittest.TestCase):
                 headers=self.headers,
                 json={
                     "cookie": (
-                        "a1=fresh-a1; web_session=fresh-session; "
-                        "id_token=padded-token=="
+                        "a1=fresh-a1; web_session=session-with-padding==; "
+                        "id_token=padded-token==; webId=browser-id"
                     )
                 },
             )
 
         self.assertEqual(response.status_code, 200)
         save_cookie.assert_called_once_with(
-            "a1=fresh-a1; web_session=fresh-session; "
-            "id_token=padded-token=="
+            "a1=fresh-a1; web_session=session-with-padding==; "
+            "id_token=padded-token==; webId=browser-id"
         )
         refresh_client.assert_called_once_with()
 
@@ -702,9 +693,13 @@ class CookieLoginRouteTests(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 400)
-        self.assertIn(
-            "DevTools cookie table exports are not accepted",
+        self.assertEqual(
             response.json()["detail"],
+            (
+                "Expected a Cookie request-header value in "
+                "'name=value; name=value' format. DevTools cookie table "
+                "exports are not accepted."
+            ),
         )
         self.assertNotIn("secret-value", response.text)
 
