@@ -64,12 +64,14 @@ DATA_DIR = os.getenv("DATA_DIR", "/app/data")
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/app/data/uploads")
 COOKIE_FILE = os.path.join(DATA_DIR, "cookie.json")
 QR_STATE_FILE = os.path.join(DATA_DIR, "qr_state.json")
+MAX_COOKIE_HEADER_BYTES = 32 * 1024
 QR_LOGIN_LIFETIME_SECONDS = 2 * 60
 QR_STATE_LOCK = threading.Lock()
 XHS_CUSTOMER_HOST = "https://customer.xiaohongshu.com"
 XHS_CREATOR_LOGIN_HOST = "https://creator.xiaohongshu.com"
 UPLOAD_TOKEN_MAX_LIFETIME_SECONDS = 5 * 60
 BASE64URL_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+COOKIE_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 TRUSTED_MEDIA_VIDEO_HOSTS = {
     host.strip().lower()
     for host in os.getenv(
@@ -184,16 +186,70 @@ def require_upload_authorization(
 
 def load_cookie() -> str:
     if os.path.exists(COOKIE_FILE):
+        os.chmod(COOKIE_FILE, 0o600)
         with open(COOKIE_FILE, "r") as f:
             data = json.load(f)
             return data.get("cookie", "")
     return ""
 
 
+def _parse_cookie_header(cookie_header: str) -> dict[str, str]:
+    if not cookie_header or not cookie_header.strip():
+        raise ValueError("Cookie header is empty")
+    if len(cookie_header.encode("utf-8")) > MAX_COOKIE_HEADER_BYTES:
+        raise ValueError("Cookie header is too large")
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in cookie_header):
+        raise ValueError("Cookie header contains control characters")
+
+    cookies = {}
+    for block in cookie_header.split(";"):
+        block = block.strip()
+        if not block:
+            continue
+        if "=" not in block:
+            raise ValueError("Cookie pair is missing '='")
+        name, value = block.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if not COOKIE_NAME_RE.fullmatch(name):
+            raise ValueError("Cookie name is invalid")
+        if name in cookies:
+            raise ValueError("Cookie name is duplicated")
+        cookies[name] = value
+    if not cookies:
+        raise ValueError("Cookie header contains no cookie pairs")
+    return cookies
+
+
+def _cookie_header_string(cookies: dict[str, str]) -> str:
+    return "; ".join(f"{name}={value}" for name, value in cookies.items())
+
+
+def _new_xhs_client(cookie: str | None = None) -> XhsClient:
+    xhs_client = XhsClient(sign=sign)
+    if cookie:
+        import requests.cookies
+
+        xhs_client.session.cookies = requests.cookies.cookiejar_from_dict(
+            _parse_cookie_header(cookie)
+        )
+    return xhs_client
+
+
 def save_cookie(cookie_str: str):
     os.makedirs(DATA_DIR, exist_ok=True)
-    with open(COOKIE_FILE, "w") as f:
-        json.dump({"cookie": cookie_str}, f)
+    temp_path = f"{COOKIE_FILE}.{uuid.uuid4().hex}.tmp"
+    try:
+        descriptor = os.open(
+            temp_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        with os.fdopen(descriptor, "w") as cookie_file:
+            json.dump({"cookie": cookie_str}, cookie_file)
+        os.replace(temp_path, COOKIE_FILE)
+    finally:
+        Path(temp_path).unlink(missing_ok=True)
 
 
 def get_client() -> XhsClient:
@@ -201,7 +257,7 @@ def get_client() -> XhsClient:
     global client
     if client is None:
         cookie = load_cookie()
-        client = XhsClient(cookie=cookie, sign=sign)
+        client = _new_xhs_client(cookie)
         # For international RedNote accounts:
         # - _host → webapi.rednote.com (found in publish-components JS)
         # - _creator_host → creator.rednote.com
@@ -241,7 +297,7 @@ def refresh_client():
     """Force-rebuild client (e.g., after QR login succeeds)."""
     global client
     cookie = load_cookie()
-    client = XhsClient(cookie=cookie, sign=sign)
+    client = _new_xhs_client(cookie)
     client._host = "https://webapi.rednote.com"
     client._creator_host = "https://creator.rednote.com"
     client.home = "https://creator.rednote.com"
@@ -257,7 +313,7 @@ def get_login_client(cookie: str | None = None) -> XhsClient:
     """Create a client using xiaohongshu.com for QR login.
     QR login must go through xiaohongshu.com — the resulting cookies
     work cross-domain against rnote.com APIs."""
-    login_client = XhsClient(cookie=cookie, sign=sign)
+    login_client = _new_xhs_client(cookie)
     # Keep default xiaohongshu.com host for login
     # Do NOT set rnote.com hosts
     return login_client
@@ -845,9 +901,26 @@ class CookieLoginRequest(BaseModel):
 @app.post("/login/cookie")
 def login_with_cookie(req: CookieLoginRequest, x_api_key: str | None = Header(None)):
     require_api_key(x_api_key)
-    if not req.cookie.strip():
-        raise HTTPException(status_code=400, detail="Cookie string is empty")
-    save_cookie(req.cookie.strip())
+    try:
+        cookies = _parse_cookie_header(req.cookie)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Expected a Cookie request-header value in "
+                "'name=value; name=value' format. DevTools cookie table "
+                "exports are not accepted."
+            ),
+        ) from exc
+    if not cookies.get("a1") or not cookies.get("web_session"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Cookie header must include non-empty a1 and web_session "
+                "cookies from a fresh authenticated Creator request."
+            ),
+        )
+    save_cookie(_cookie_header_string(cookies))
     refresh_client()
     return {"status": "ok", "message": "Cookie saved. Use /session/status to verify."}
 
@@ -860,8 +933,8 @@ def session_status(x_api_key: str | None = Header(None)):
     try:
         info = xhs.get_self_info()
         return {"valid": True, "user_info": info}
-    except Exception as e:
-        return {"valid": False, "error": str(e)}
+    except Exception:
+        return {"valid": False, "error": "Session validation failed"}
 
 
 # --- File Upload ---

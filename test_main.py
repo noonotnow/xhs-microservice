@@ -322,6 +322,113 @@ class CreatorQRProtocolTests(unittest.TestCase):
         )
 
 
+class CookieLoginRouteTests(unittest.TestCase):
+    def setUp(self):
+        self.client = TestClient(main.app)
+        self.headers = {"X-Api-Key": main.API_KEY}
+
+    def test_accepts_cookie_header_and_preserves_equals_in_value(self):
+        with (
+            patch.object(main, "save_cookie") as save_cookie,
+            patch.object(main, "refresh_client") as refresh_client,
+        ):
+            response = self.client.post(
+                "/login/cookie",
+                headers=self.headers,
+                json={
+                    "cookie": (
+                        "a1=fresh-a1; web_session=session-with-padding==; "
+                        "webId=browser-id"
+                    )
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        save_cookie.assert_called_once_with(
+            "a1=fresh-a1; web_session=session-with-padding==; webId=browser-id"
+        )
+        refresh_client.assert_called_once_with()
+
+    def test_rejects_devtools_table_export_without_echoing_input(self):
+        response = self.client.post(
+            "/login/cookie",
+            headers=self.headers,
+            json={
+                "cookie": (
+                    "web_session\tsecret-value\t.rednote.com\t/\tSession"
+                )
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.json()["detail"],
+            (
+                "Expected a Cookie request-header value in "
+                "'name=value; name=value' format. DevTools cookie table "
+                "exports are not accepted."
+            ),
+        )
+        self.assertNotIn("secret-value", response.text)
+
+    def test_rejects_header_without_required_session_cookies(self):
+        response = self.client.post(
+            "/login/cookie",
+            headers=self.headers,
+            json={"cookie": "webId=browser-id; xsecappid=ugc"},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("a1 and web_session", response.json()["detail"])
+
+    def test_cookie_login_requires_api_key_before_parsing(self):
+        response = self.client.post(
+            "/login/cookie",
+            json={"cookie": "not a valid cookie header"},
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_session_failure_does_not_return_upstream_payload(self):
+        upstream_error = "cookie=must-not-escape"
+        with patch.object(
+            main,
+            "get_client",
+            return_value=types.SimpleNamespace(
+                get_self_info=lambda: (_ for _ in ()).throw(
+                    RuntimeError(upstream_error)
+                )
+            ),
+        ):
+            response = self.client.get(
+                "/session/status",
+                headers=self.headers,
+            )
+
+        self.assertEqual(
+            response.json(),
+            {"valid": False, "error": "Session validation failed"},
+        )
+        self.assertNotIn(upstream_error, response.text)
+
+    def test_saved_cookie_file_is_private_and_old_file_is_tightened(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            cookie_file = os.path.join(data_dir, "cookie.json")
+            with (
+                patch.object(main, "DATA_DIR", data_dir),
+                patch.object(main, "COOKIE_FILE", cookie_file),
+            ):
+                main.save_cookie("a1=fresh; web_session=fresh")
+                self.assertEqual(os.stat(cookie_file).st_mode & 0o777, 0o600)
+
+                os.chmod(cookie_file, 0o644)
+                self.assertEqual(
+                    main.load_cookie(),
+                    "a1=fresh; web_session=fresh",
+                )
+                self.assertEqual(os.stat(cookie_file).st_mode & 0o777, 0o600)
+
+
 class RemoteVideoDownloadTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
