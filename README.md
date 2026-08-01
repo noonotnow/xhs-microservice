@@ -88,19 +88,33 @@ authenticated browser request's `Cookie` header:
 Do not paste a DevTools cookie table export; domain, path, expiry, and other
 columns are rejected. Cookies copied from a fresh authenticated
 `creator.rednote.com` request are supported: the pinned client receives the
-name/value pairs directly, so they do not have to originate from a
-`xiaohongshu.com` domain. Both `a1` and `web_session` are required. Cookie
-values are never logged or returned, and invalid-session responses are
-sanitized. A submitted cookie is first validated through the same signed
-Creator request path used by publishing, including the authenticated session
-cookies and browser-compatible Origin, Referer, User-Agent, and Accept headers.
-The read-only profile request is
-`GET https://creator.rednote.com/api/galaxy/creator/home/personal_info`.
-Only a successful Creator response is persisted and installed; a failed
-replacement leaves the prior cookie file and active publishing client intact.
-Login redirects and XHS result `-100` return HTTP 401 with
-`creator_session_invalid` and `relogin_required: true`. Temporary upstream
-validation failures return HTTP 502 without replacing the session.
+name/value pairs as an explicit request-local `Cookie` header, bypassing
+Requests cookie-jar domain and path filtering. Supplemental defaults never
+replace submitted cookie names. Both `a1` and `web_session` are required.
+Cookie values and names are never logged or returned.
+
+A submitted cookie is validated through the signed Creator upload-permit GET
+already used by publishing:
+
+```text
+https://creator.rednote.com/api/media/v1/upload/web/permit?biz_name=spectrum&scene=image&file_count=1&version=1&source=web
+```
+
+The request includes request-local signing plus browser-compatible Origin,
+Referer, User-Agent, Accept, and Sec-Fetch headers. Validation does not mutate
+the candidate or active session headers or cookie jar. Only a successful
+response containing a usable file ID and upload token is persisted and
+installed; there is no fallback acceptance. A failed replacement leaves the
+prior cookie file and active publishing client intact.
+
+Redirects, HTTP 401/403, and XHS session-expired result `-100` return HTTP 401
+with `creator_session_invalid`, `relogin_required: true`, and a sanitized
+`reason` of `redirect`, `http_401`, `http_403`, or `api_session_expired`.
+Numeric `upstream_status` and `upstream_code` fields may be included; no
+Location, headers, response bodies, or arbitrary upstream fields are exposed.
+Transport failures, 5xx responses, malformed payloads, and unexpected success
+shapes return sanitized HTTP 502 `creator_session_validation_unavailable`
+without replacing the session.
 
 `GET /session/status` uses the same Creator profile boundary and returns stable
 sanitized metadata without forwarding the profile payload:
@@ -110,9 +124,9 @@ sanitized metadata without forwarding the profile payload:
   "valid": true,
   "session_type": "rednote_creator",
   "validation": {
-    "method": "creator_profile",
+    "method": "creator_upload_permit",
     "host": "creator.rednote.com",
-    "path": "/api/galaxy/creator/home/personal_info"
+    "path": "/api/media/v1/upload/web/permit"
   },
   "relogin_required": false
 }
