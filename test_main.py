@@ -36,8 +36,14 @@ class QRLoginRouteTests(unittest.TestCase):
             "QR_STATE_FILE",
             os.path.join(self.temp_dir.name, "qr_state.json"),
         )
+        self.qr_rejected_file_patch = patch.object(
+            main,
+            "QR_REJECTED_STATE_FILE",
+            os.path.join(self.temp_dir.name, "qr_rejected.json"),
+        )
         self.data_dir_patch.start()
         self.qr_file_patch.start()
+        self.qr_rejected_file_patch.start()
         main.login_client = None
         main.RECENT_REJECTED_QR_IDS.clear()
         self.client = TestClient(main.app)
@@ -46,6 +52,7 @@ class QRLoginRouteTests(unittest.TestCase):
     def tearDown(self):
         main.login_client = None
         main.RECENT_REJECTED_QR_IDS.clear()
+        self.qr_rejected_file_patch.stop()
         self.qr_file_patch.stop()
         self.data_dir_patch.stop()
         self.temp_dir.cleanup()
@@ -70,7 +77,8 @@ class QRLoginRouteTests(unittest.TestCase):
             main,
             "_create_creator_qr",
             return_value={
-                "id": "qr-id",
+                "qr_id": "qr-id",
+                "code": "123456",
                 "url": "xhsdiscover://login",
             },
         ):
@@ -91,6 +99,7 @@ class QRLoginRouteTests(unittest.TestCase):
         main._save_qr_state({
             "flow": "creator",
             "qr_id": "old-id",
+            "code": "123456",
             "login_cookie": "old-cookie",
             "expires_at": int(time.time()) + 60,
         })
@@ -107,8 +116,16 @@ class QRLoginRouteTests(unittest.TestCase):
                 main,
                 "_create_creator_qr",
                 side_effect=[
-                    {"id": "old-id", "url": "xhsdiscover://old"},
-                    {"id": "new-id", "url": "xhsdiscover://new"},
+                    {
+                        "qr_id": "old-id",
+                        "code": "123456",
+                        "url": "xhsdiscover://old",
+                    },
+                    {
+                        "qr_id": "new-id",
+                        "code": "654321",
+                        "url": "xhsdiscover://new",
+                    },
                 ],
             ),
         ):
@@ -140,12 +157,14 @@ class QRLoginRouteTests(unittest.TestCase):
                 "_create_creator_qr",
                 side_effect=[
                     {
-                        "id": "expired-id",
+                        "qr_id": "expired-id",
+                        "code": "123456",
                         "url": "xhsdiscover://expired",
                         "expires_at": now - 1,
                     },
                     {
-                        "id": "fresh-id",
+                        "qr_id": "fresh-id",
+                        "code": "654321",
                         "url": "xhsdiscover://fresh",
                         "expires_at": upstream_expiry_ms,
                     },
@@ -171,12 +190,14 @@ class QRLoginRouteTests(unittest.TestCase):
                 "_create_creator_qr",
                 side_effect=[
                     {
-                        "id": "expired-id",
+                        "qr_id": "expired-id",
+                        "code": "123456",
                         "url": "xhsdiscover://expired",
                         "expires_at": now - 1,
                     },
                     {
-                        "id": "expired-id",
+                        "qr_id": "expired-id",
+                        "code": "123456",
                         "url": "xhsdiscover://same-id-without-expiry",
                     },
                 ],
@@ -202,20 +223,24 @@ class QRLoginRouteTests(unittest.TestCase):
                 "_create_creator_qr",
                 side_effect=[
                     {
-                        "id": "expired-id",
+                        "qr_id": "expired-id",
+                        "code": "123456",
                         "url": "xhsdiscover://expired",
                         "expires_at": now - 1,
                     },
                     {
-                        "id": "expired-id",
+                        "qr_id": "expired-id",
+                        "code": "123456",
                         "url": "xhsdiscover://same-id",
                     },
                     {
-                        "id": "expired-id",
+                        "qr_id": "expired-id",
+                        "code": "123456",
                         "url": "xhsdiscover://same-id-again",
                     },
                     {
-                        "id": "fresh-id",
+                        "qr_id": "fresh-id",
+                        "code": "654321",
                         "url": "xhsdiscover://fresh",
                     },
                 ],
@@ -233,6 +258,36 @@ class QRLoginRouteTests(unittest.TestCase):
         self.assertEqual(first_response.status_code, 502)
         self.assertEqual(second_response.status_code, 200)
         self.assertEqual(second_response.json()["qr_id"], "fresh-id")
+
+    def test_rejected_qr_id_remains_blocked_after_process_restart(self):
+        now = 2_000_000_000
+        main._remember_rejected_qr_id("expired-id", now)
+        main.RECENT_REJECTED_QR_IDS.clear()
+
+        with (
+            patch.object(main.time, "time", return_value=now),
+            patch.object(main, "get_login_client", return_value=FakeLoginClient()),
+            patch.object(
+                main,
+                "_create_creator_qr",
+                side_effect=[
+                    {
+                        "qr_id": "expired-id",
+                        "code": "123456",
+                        "url": "xhsdiscover://stale",
+                    },
+                    {
+                        "qr_id": "fresh-id",
+                        "code": "654321",
+                        "url": "xhsdiscover://fresh",
+                    },
+                ],
+            ),
+        ):
+            response = self.client.get("/login/qr", headers=self.headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["qr_id"], "fresh-id")
 
     def test_qr_generation_failure_clears_stale_state(self):
         Path(main.QR_STATE_FILE).write_text('{"stale": true}')
@@ -257,10 +312,42 @@ class QRLoginRouteTests(unittest.TestCase):
         )
         self.assertFalse(os.path.exists(main.QR_STATE_FILE))
 
+    def test_qr_generation_rejects_merchant_qianfan_target(self):
+        merchant_url = (
+            "https://oia.xiaohongshu.com/thor/home/main"
+            "?deepLink=xymerchant%3A%2F%2Flogin"
+        )
+        with (
+            patch.object(
+                main,
+                "get_login_client",
+                return_value=FakeLoginClient(),
+            ),
+            patch.object(
+                main,
+                "_create_creator_qr",
+                return_value={
+                    "qr_id": "merchant-id",
+                    "code": "123456",
+                    "url": merchant_url,
+                },
+            ),
+        ):
+            response = self.client.get("/login/qr", headers=self.headers)
+
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(
+            response.json(),
+            {"detail": "Could not generate XHS QR code"},
+        )
+        self.assertNotIn("xymerchant", response.text)
+        self.assertFalse(os.path.exists(main.QR_STATE_FILE))
+
     def test_expired_qr_state_is_removed(self):
         main._save_qr_state({
             "flow": "creator",
             "qr_id": "old-id",
+            "code": "123456",
             "login_cookie": "temporary",
             "expires_at": int(time.time()) - 1,
         })
@@ -276,6 +363,7 @@ class QRLoginRouteTests(unittest.TestCase):
         main._save_qr_state({
             "flow": "creator",
             "qr_id": "qr-id",
+            "code": "123456",
             "login_cookie": "persisted-temporary-cookie",
             "expires_at": int(time.time()) + 60,
         })
@@ -288,13 +376,18 @@ class QRLoginRouteTests(unittest.TestCase):
         ) as get_login_client, patch.object(
             main,
             "_check_creator_qr",
-            return_value={"status": 0},
-        ):
+            return_value={"code_status": 1},
+        ) as check_creator_qr:
             response = self.client.get("/login/status", headers=self.headers)
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["code_status"], 1)
         get_login_client.assert_called_once_with("persisted-temporary-cookie")
+        check_creator_qr.assert_called_once_with(
+            resumed_client,
+            "qr-id",
+            "123456",
+        )
         state = json.loads(Path(main.QR_STATE_FILE).read_text())
         self.assertEqual(
             state["login_cookie"],
@@ -305,6 +398,7 @@ class QRLoginRouteTests(unittest.TestCase):
         main._save_qr_state({
             "flow": "creator",
             "qr_id": "qr-id",
+            "code": "123456",
             "login_cookie": "temporary",
             "expires_at": int(time.time()) + 60,
         })
@@ -313,7 +407,7 @@ class QRLoginRouteTests(unittest.TestCase):
         with patch.object(
             main,
             "_check_creator_qr",
-            return_value={"status": 2},
+            return_value={"code_status": 0},
         ):
             response = self.client.get("/login/status", headers=self.headers)
 
@@ -326,6 +420,7 @@ class QRLoginRouteTests(unittest.TestCase):
         main._save_qr_state({
             "flow": "creator",
             "qr_id": "qr-id",
+            "code": "123456",
             "login_cookie": "temporary",
             "expires_at": int(time.time()) + 60,
         })
@@ -336,9 +431,8 @@ class QRLoginRouteTests(unittest.TestCase):
             patch.object(
                 main,
                 "_check_creator_qr",
-                return_value={"status": 1, "ticket": "one-time-ticket"},
+                return_value={"code_status": 2, "login_info": {}},
             ),
-            patch.object(main, "_complete_creator_login") as complete_login,
             patch.object(main, "save_cookie") as save_cookie,
             patch.object(main, "refresh_client") as refresh_client,
         ):
@@ -346,10 +440,6 @@ class QRLoginRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["code_status"], 2)
-        complete_login.assert_called_once_with(
-            authenticated_client,
-            "one-time-ticket",
-        )
         save_cookie.assert_called_once_with("authenticated-cookie")
         refresh_client.assert_called_once_with()
         self.assertFalse(os.path.exists(main.QR_STATE_FILE))
@@ -423,7 +513,7 @@ class CreatorQRProtocolTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["revision"], "commit-sha")
 
-    def test_creator_qr_uses_customer_cas_endpoint_and_quick_signature(self):
+    def test_creator_qr_uses_first_party_rednote_endpoint(self):
         class Response:
             status_code = 200
 
@@ -431,7 +521,8 @@ class CreatorQRProtocolTests(unittest.TestCase):
                 return {
                     "success": True,
                     "data": {
-                        "id": "creator-qr-id",
+                        "qr_id": "creator-qr-id",
+                        "code": "123456",
                         "url": "xhsdiscover://creator-login",
                     },
                 }
@@ -457,23 +548,72 @@ class CreatorQRProtocolTests(unittest.TestCase):
         ) as sign:
             result = main._create_creator_qr(client)
 
-        self.assertEqual(result["id"], "creator-qr-id")
+        self.assertEqual(result["qr_id"], "creator-qr-id")
         args, kwargs = client.session.request_args
         self.assertEqual(args[0], "POST")
         self.assertEqual(
             args[1],
-            "https://customer.xiaohongshu.com/api/cas/customer/web/qr-code",
+            "https://webapi.rednote.com/api/sns/web/v1/login/qrcode/create",
         )
-        self.assertEqual(
-            json.loads(kwargs["data"]),
-            {"service": "https://creator.xiaohongshu.com"},
-        )
+        self.assertEqual(json.loads(kwargs["data"]), {})
         sign.assert_called_once_with(
-            "/api/cas/customer/web/qr-code",
-            {"service": "https://creator.xiaohongshu.com"},
+            "/api/sns/web/v1/login/qrcode/create",
+            {},
             a1="",
             web_session="",
         )
+
+    def test_creator_qr_status_uses_first_party_rednote_endpoint(self):
+        class Response:
+            status_code = 200
+
+            def json(self):
+                return {
+                    "success": True,
+                    "data": {"code_status": 0},
+                }
+
+        session = types.SimpleNamespace(
+            request=unittest.mock.Mock(return_value=Response())
+        )
+        client = types.SimpleNamespace(
+            cookie_dict={},
+            session=session,
+            timeout=10,
+            proxies=None,
+        )
+        with patch.object(main, "sign", return_value={}):
+            result = main._check_creator_qr(
+                client,
+                "qr-id",
+                "123456",
+            )
+
+        self.assertEqual(result["code_status"], 0)
+        args, kwargs = session.request.call_args
+        self.assertEqual(args[0], "GET")
+        self.assertEqual(
+            args[1],
+            (
+                "https://webapi.rednote.com/api/sns/web/v1/login/"
+                "qrcode/status?qr_id=qr-id&code=123456"
+            ),
+        )
+
+    def test_merchant_and_qianfan_qr_urls_are_rejected(self):
+        self.assertFalse(main._is_supported_creator_qr_url(
+            "https://oia.xiaohongshu.com/thor/home/main"
+            "?deepLink=xymerchant%253A%252F%252Flogin"
+        ))
+        self.assertFalse(main._is_supported_creator_qr_url(
+            "xhsdiscover://qianfan/login"
+        ))
+        self.assertFalse(main._is_supported_creator_qr_url(
+            "xhsdiscover://%25252571ianfan/login"
+        ))
+        self.assertTrue(main._is_supported_creator_qr_url(
+            "xhsdiscover://creator/login"
+        ))
 
     def test_creator_qr_failure_exposes_only_numeric_code(self):
         class Response:
@@ -520,6 +660,110 @@ class CreatorQRProtocolTests(unittest.TestCase):
             json.loads(response.body),
             {"error": "Internal server error"},
         )
+
+
+class CookieLoginRouteTests(unittest.TestCase):
+    def setUp(self):
+        self.client = TestClient(main.app)
+        self.headers = {"X-Api-Key": main.API_KEY}
+
+    def test_accepts_rednote_cookie_header_and_preserves_token_padding(self):
+        with (
+            patch.object(main, "save_cookie") as save_cookie,
+            patch.object(main, "refresh_client") as refresh_client,
+        ):
+            response = self.client.post(
+                "/login/cookie",
+                headers=self.headers,
+                json={
+                    "cookie": (
+                        "a1=fresh-a1; web_session=fresh-session; "
+                        "id_token=padded-token=="
+                    )
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        save_cookie.assert_called_once_with(
+            "a1=fresh-a1; web_session=fresh-session; "
+            "id_token=padded-token=="
+        )
+        refresh_client.assert_called_once_with()
+
+    def test_rejects_devtools_table_export_without_echoing_input(self):
+        response = self.client.post(
+            "/login/cookie",
+            headers=self.headers,
+            json={
+                "cookie": (
+                    "web_session\tsecret-value\t.rednote.com\t/\tSession"
+                )
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(
+            "DevTools cookie table exports are not accepted",
+            response.json()["detail"],
+        )
+        self.assertNotIn("secret-value", response.text)
+
+    def test_rejects_header_without_required_session_cookies(self):
+        response = self.client.post(
+            "/login/cookie",
+            headers=self.headers,
+            json={"cookie": "id_token=token; webId=browser-id"},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("a1 and web_session", response.json()["detail"])
+
+    def test_cookie_login_requires_api_key_before_parsing(self):
+        response = self.client.post(
+            "/login/cookie",
+            json={"cookie": "not a valid cookie header"},
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_session_failure_does_not_return_upstream_payload(self):
+        upstream_error = "cookie=must-not-escape"
+        with patch.object(
+            main,
+            "get_client",
+            return_value=types.SimpleNamespace(
+                get_self_info=lambda: (_ for _ in ()).throw(
+                    RuntimeError(upstream_error)
+                )
+            ),
+        ):
+            response = self.client.get(
+                "/session/status",
+                headers=self.headers,
+            )
+
+        self.assertEqual(
+            response.json(),
+            {"valid": False, "error": "Session validation failed"},
+        )
+        self.assertNotIn(upstream_error, response.text)
+
+    def test_saved_cookie_file_is_private_and_old_file_is_tightened(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            cookie_file = os.path.join(data_dir, "cookie.json")
+            with (
+                patch.object(main, "DATA_DIR", data_dir),
+                patch.object(main, "COOKIE_FILE", cookie_file),
+            ):
+                main.save_cookie("a1=fresh; web_session=fresh")
+                self.assertEqual(os.stat(cookie_file).st_mode & 0o777, 0o600)
+
+                os.chmod(cookie_file, 0o644)
+                self.assertEqual(
+                    main.load_cookie(),
+                    "a1=fresh; web_session=fresh",
+                )
+                self.assertEqual(os.stat(cookie_file).st_mode & 0o777, 0o600)
 
 
 class RemoteVideoDownloadTests(unittest.IsolatedAsyncioTestCase):

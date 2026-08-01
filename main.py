@@ -77,16 +77,19 @@ DATA_DIR = os.getenv("DATA_DIR", "/app/data")
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/app/data/uploads")
 COOKIE_FILE = os.path.join(DATA_DIR, "cookie.json")
 QR_STATE_FILE = os.path.join(DATA_DIR, "qr_state.json")
+QR_REJECTED_STATE_FILE = os.path.join(DATA_DIR, "qr_rejected.json")
+MAX_COOKIE_HEADER_BYTES = 32 * 1024
+MAX_QR_URL_BYTES = 8 * 1024
 QR_LOGIN_LIFETIME_SECONDS = 2 * 60
 QR_EXPIRY_SAFETY_SECONDS = 5
 QR_CREATION_ATTEMPTS = 2
 QR_REJECTED_ID_LIFETIME_SECONDS = 5 * 60
 QR_STATE_LOCK = threading.Lock()
 RECENT_REJECTED_QR_IDS: dict[str, int] = {}
-XHS_CUSTOMER_HOST = "https://customer.xiaohongshu.com"
-XHS_CREATOR_LOGIN_HOST = "https://creator.xiaohongshu.com"
+XHS_WEBAPI_LOGIN_HOST = "https://webapi.rednote.com"
 UPLOAD_TOKEN_MAX_LIFETIME_SECONDS = 5 * 60
 BASE64URL_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+COOKIE_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 TRUSTED_MEDIA_VIDEO_HOSTS = {
     host.strip().lower()
     for host in os.getenv(
@@ -201,16 +204,70 @@ def require_upload_authorization(
 
 def load_cookie() -> str:
     if os.path.exists(COOKIE_FILE):
+        os.chmod(COOKIE_FILE, 0o600)
         with open(COOKIE_FILE, "r") as f:
             data = json.load(f)
             return data.get("cookie", "")
     return ""
 
 
+def _parse_cookie_header(cookie_header: str) -> dict[str, str]:
+    if not cookie_header or not cookie_header.strip():
+        raise ValueError("Cookie header is empty")
+    if len(cookie_header.encode("utf-8")) > MAX_COOKIE_HEADER_BYTES:
+        raise ValueError("Cookie header is too large")
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in cookie_header):
+        raise ValueError("Cookie header contains control characters")
+
+    cookies = {}
+    for block in cookie_header.split(";"):
+        block = block.strip()
+        if not block:
+            continue
+        if "=" not in block:
+            raise ValueError("Cookie pair is missing '='")
+        name, value = block.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if not COOKIE_NAME_RE.fullmatch(name):
+            raise ValueError("Cookie name is invalid")
+        if name in cookies:
+            raise ValueError("Cookie name is duplicated")
+        cookies[name] = value
+    if not cookies:
+        raise ValueError("Cookie header contains no cookie pairs")
+    return cookies
+
+
+def _cookie_header_string(cookies: dict[str, str]) -> str:
+    return "; ".join(f"{name}={value}" for name, value in cookies.items())
+
+
+def _new_xhs_client(cookie: str | None = None) -> XhsClient:
+    xhs_client = XhsClient(sign=sign)
+    if cookie:
+        import requests.cookies
+
+        xhs_client.session.cookies = requests.cookies.cookiejar_from_dict(
+            _parse_cookie_header(cookie)
+        )
+    return xhs_client
+
+
 def save_cookie(cookie_str: str):
     os.makedirs(DATA_DIR, exist_ok=True)
-    with open(COOKIE_FILE, "w") as f:
-        json.dump({"cookie": cookie_str}, f)
+    temp_path = f"{COOKIE_FILE}.{uuid.uuid4().hex}.tmp"
+    try:
+        descriptor = os.open(
+            temp_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        with os.fdopen(descriptor, "w") as cookie_file:
+            json.dump({"cookie": cookie_str}, cookie_file)
+        os.replace(temp_path, COOKIE_FILE)
+    finally:
+        Path(temp_path).unlink(missing_ok=True)
 
 
 def get_client() -> XhsClient:
@@ -218,7 +275,7 @@ def get_client() -> XhsClient:
     global client
     if client is None:
         cookie = load_cookie()
-        client = XhsClient(cookie=cookie, sign=sign)
+        client = _new_xhs_client(cookie)
         # For international RedNote accounts:
         # - _host → webapi.rednote.com (found in publish-components JS)
         # - _creator_host → creator.rednote.com
@@ -258,7 +315,7 @@ def refresh_client():
     """Force-rebuild client (e.g., after QR login succeeds)."""
     global client
     cookie = load_cookie()
-    client = XhsClient(cookie=cookie, sign=sign)
+    client = _new_xhs_client(cookie)
     client._host = "https://webapi.rednote.com"
     client._creator_host = "https://creator.rednote.com"
     client.home = "https://creator.rednote.com"
@@ -363,9 +420,9 @@ def _create_creator_qr(xhs_client: XhsClient) -> dict:
     return _login_request(
         xhs_client,
         "POST",
-        XHS_CUSTOMER_HOST,
-        "/api/cas/customer/web/qr-code",
-        data={"service": XHS_CREATOR_LOGIN_HOST},
+        XHS_WEBAPI_LOGIN_HOST,
+        "/api/sns/web/v1/login/qrcode/create",
+        data={},
     )
 
 
@@ -404,6 +461,20 @@ def _creator_qr_expires_at(qr: dict, now: int) -> int:
 
 
 def _recent_rejected_qr_ids(now: int) -> set[str]:
+    try:
+        with open(QR_REJECTED_STATE_FILE, "r") as rejected_file:
+            persisted_ids = json.load(rejected_file)
+        if not isinstance(persisted_ids, dict) or any(
+            not isinstance(qr_id, str) or type(rejected_until) is not int
+            for qr_id, rejected_until in persisted_ids.items()
+        ):
+            raise ValueError("Invalid rejected QR state")
+        RECENT_REJECTED_QR_IDS.update(persisted_ids)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, json.JSONDecodeError):
+        Path(QR_REJECTED_STATE_FILE).unlink(missing_ok=True)
+
     expired_ids = [
         qr_id
         for qr_id, rejected_until in RECENT_REJECTED_QR_IDS.items()
@@ -411,47 +482,71 @@ def _recent_rejected_qr_ids(now: int) -> set[str]:
     ]
     for qr_id in expired_ids:
         del RECENT_REJECTED_QR_IDS[qr_id]
+    _save_rejected_qr_ids()
     return set(RECENT_REJECTED_QR_IDS)
+
+
+def _save_rejected_qr_ids() -> None:
+    if not RECENT_REJECTED_QR_IDS:
+        Path(QR_REJECTED_STATE_FILE).unlink(missing_ok=True)
+        return
+    os.makedirs(DATA_DIR, exist_ok=True)
+    temp_path = f"{QR_REJECTED_STATE_FILE}.{uuid.uuid4().hex}.tmp"
+    try:
+        descriptor = os.open(
+            temp_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        with os.fdopen(descriptor, "w") as rejected_file:
+            json.dump(RECENT_REJECTED_QR_IDS, rejected_file)
+        os.replace(temp_path, QR_REJECTED_STATE_FILE)
+    finally:
+        Path(temp_path).unlink(missing_ok=True)
 
 
 def _remember_rejected_qr_id(qr_id: str, now: int) -> None:
     RECENT_REJECTED_QR_IDS[qr_id] = (
         now + QR_REJECTED_ID_LIFETIME_SECONDS
     )
+    _save_rejected_qr_ids()
 
 
-def _check_creator_qr(xhs_client: XhsClient, qr_id: str) -> dict:
+def _is_supported_creator_qr_url(url: str) -> bool:
+    if len(url.encode("utf-8")) > MAX_QR_URL_BYTES:
+        return False
+    decoded_url = url
+    for _ in range(10):
+        next_url = unquote(decoded_url)
+        if next_url == decoded_url:
+            break
+        decoded_url = next_url
+    else:
+        return False
+    if unquote(decoded_url) != decoded_url:
+        return False
+    lowered_url = decoded_url.lower()
+    return (
+        urlparse(decoded_url).scheme.lower() == "xhsdiscover"
+        and "xymerchant" not in lowered_url
+        and "qianfan" not in lowered_url
+    )
+
+
+def _check_creator_qr(
+    xhs_client: XhsClient,
+    qr_id: str,
+    code: str,
+) -> dict:
     return _login_request(
         xhs_client,
         "GET",
-        XHS_CUSTOMER_HOST,
-        "/api/cas/customer/web/qr-code",
+        XHS_WEBAPI_LOGIN_HOST,
+        "/api/sns/web/v1/login/qrcode/status",
         params={
-            "service": XHS_CREATOR_LOGIN_HOST,
-            "qr_code_id": qr_id,
+            "qr_id": qr_id,
+            "code": code,
         },
-    )
-
-
-def _complete_creator_login(xhs_client: XhsClient, ticket: str) -> None:
-    _login_request(
-        xhs_client,
-        "POST",
-        XHS_CREATOR_LOGIN_HOST,
-        "/sso/customer_login",
-        data={
-            "ticket": ticket,
-            "login_service": XHS_CREATOR_LOGIN_HOST,
-            "subsystem_alias": "creator",
-            "set_global_domain": True,
-        },
-    )
-    _login_request(
-        xhs_client,
-        "POST",
-        XHS_CREATOR_LOGIN_HOST,
-        "/api/galaxy/user/cas/login",
-        referer=f"{XHS_CREATOR_LOGIN_HOST}/login",
     )
 
 
@@ -481,6 +576,7 @@ def _load_qr_state() -> dict:
             not isinstance(state, dict)
             or state.get("flow") != "creator"
             or not isinstance(state.get("qr_id"), str)
+            or not isinstance(state.get("code"), str)
             or not isinstance(state.get("login_cookie"), str)
             or type(state.get("expires_at")) is not int
         ):
@@ -843,27 +939,30 @@ def get_qr(x_api_key: str | None = Header(None)):
                 candidate_qr = _create_creator_qr(candidate_client)
                 if not all(
                     isinstance(candidate_qr.get(key), str) and candidate_qr[key]
-                    for key in ("id", "url")
+                    for key in ("qr_id", "code", "url")
                 ):
                     raise ValueError("XHS returned incomplete QR data")
+                if not _is_supported_creator_qr_url(candidate_qr["url"]):
+                    raise ValueError("XHS returned a non-creator QR target")
                 now = int(time.time())
                 candidate_expiry = _creator_qr_expires_at(candidate_qr, now)
                 if (
-                    candidate_qr["id"] not in rejected_qr_ids
+                    candidate_qr["qr_id"] not in rejected_qr_ids
                     and candidate_expiry > now
                 ):
                     qr = candidate_qr
                     new_login_client = candidate_client
                     expires_at = candidate_expiry
                     break
-                rejected_qr_ids.add(candidate_qr["id"])
-                _remember_rejected_qr_id(candidate_qr["id"], now)
+                rejected_qr_ids.add(candidate_qr["qr_id"])
+                _remember_rejected_qr_id(candidate_qr["qr_id"], now)
             if qr is None or new_login_client is None:
                 raise ValueError("XHS returned a stale or expired QR code")
             login_client = new_login_client
             _save_qr_state({
                 "flow": "creator",
-                "qr_id": qr["id"],
+                "qr_id": qr["qr_id"],
+                "code": qr["code"],
                 "login_cookie": login_client.cookie,
                 "expires_at": expires_at,
             })
@@ -884,8 +983,8 @@ def get_qr(x_api_key: str | None = Header(None)):
                 detail="Could not generate XHS QR code",
             ) from exc
     return {
-        "qr_id": qr["id"],
-        "code": "",
+        "qr_id": qr["qr_id"],
+        "code": qr["code"],
         "url": qr["url"],
         "expires_at": expires_at,
     }
@@ -900,6 +999,10 @@ def check_login_status(x_api_key: str | None = Header(None)):
             raise HTTPException(status_code=400, detail="No QR login in progress. Call /login/qr first.")
         qr_state = _load_qr_state()
         if qr_state["expires_at"] <= int(time.time()):
+            _remember_rejected_qr_id(
+                qr_state["qr_id"],
+                int(time.time()),
+            )
             _clear_qr_state()
             return {
                 "code_status": -1,
@@ -909,46 +1012,45 @@ def check_login_status(x_api_key: str | None = Header(None)):
         if login_client is None:
             login_client = get_login_client(qr_state["login_cookie"])
         try:
-            status = _check_creator_qr(login_client, qr_state["qr_id"])
+            status = _check_creator_qr(
+                login_client,
+                qr_state["qr_id"],
+                qr_state["code"],
+            )
         except XhsLoginProtocolError as exc:
             logger.warning(
                 "XHS Creator QR status rejected with code %s",
                 exc.code,
+            )
+            _remember_rejected_qr_id(
+                qr_state["qr_id"],
+                int(time.time()),
             )
             _clear_qr_state()
             raise HTTPException(
                 status_code=502,
                 detail="XHS QR login status is currently unavailable",
             ) from exc
-        creator_status = status.get("status")
-        if creator_status == 1:
-            ticket = status.get("ticket")
-            if not isinstance(ticket, str) or not ticket:
-                _clear_qr_state()
-                raise HTTPException(
-                    status_code=502,
-                    detail="XHS QR login returned an invalid confirmation",
-                )
-            try:
-                _complete_creator_login(login_client, ticket)
-            except XhsLoginProtocolError as exc:
-                logger.warning(
-                    "XHS Creator login completion rejected with code %s",
-                    exc.code,
-                )
-                _clear_qr_state()
-                raise HTTPException(
-                    status_code=502,
-                    detail="XHS QR login could not be completed",
-                ) from exc
-            # Save cookies from xiaohongshu.com login
-            save_cookie(login_client.cookie)
-            # Rebuild the main client with rnote.com hosts + fresh cookies
-            refresh_client()
+        code_status = status.get("code_status")
+        if code_status not in (0, 1, 2):
+            _remember_rejected_qr_id(
+                qr_state["qr_id"],
+                int(time.time()),
+            )
             _clear_qr_state()
-            code_status = 2
+            raise HTTPException(
+                status_code=502,
+                detail="XHS QR login returned an invalid status",
+            )
+        if code_status == 2:
+            save_cookie(login_client.cookie)
+            refresh_client()
+            _remember_rejected_qr_id(
+                qr_state["qr_id"],
+                int(time.time()),
+            )
+            _clear_qr_state()
         else:
-            code_status = 1 if creator_status == 0 else 0
             qr_state["login_cookie"] = login_client.cookie
             _save_qr_state(qr_state)
         return {
@@ -966,9 +1068,26 @@ class CookieLoginRequest(BaseModel):
 @app.post("/login/cookie")
 def login_with_cookie(req: CookieLoginRequest, x_api_key: str | None = Header(None)):
     require_api_key(x_api_key)
-    if not req.cookie.strip():
-        raise HTTPException(status_code=400, detail="Cookie string is empty")
-    save_cookie(req.cookie.strip())
+    try:
+        cookies = _parse_cookie_header(req.cookie)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Expected a Cookie request-header value in "
+                "'name=value; name=value' format. DevTools cookie table "
+                "exports are not accepted."
+            ),
+        ) from exc
+    if not cookies.get("a1") or not cookies.get("web_session"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Cookie header must include non-empty a1 and web_session "
+                "cookies from a fresh authenticated Creator request."
+            ),
+        )
+    save_cookie(_cookie_header_string(cookies))
     refresh_client()
     return {"status": "ok", "message": "Cookie saved. Use /session/status to verify."}
 
@@ -981,8 +1100,8 @@ def session_status(x_api_key: str | None = Header(None)):
     try:
         info = xhs.get_self_info()
         return {"valid": True, "user_info": info}
-    except Exception as e:
-        return {"valid": False, "error": str(e)}
+    except Exception:
+        return {"valid": False, "error": "Session validation failed"}
 
 
 # --- File Upload ---

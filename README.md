@@ -64,28 +64,41 @@ ahead. Use a separate high-entropy secret from `XHS_API_KEY`.
 3. Poll `GET /login/status` until `code_status == 2`
 4. Session cookie is saved automatically
 
-QR creation uses XHS's Creator CAS QR flow with a fresh anonymous client, so an
-expired production cookie cannot prevent regeneration. The legacy web QR
-endpoint used by `xhs==0.2.13` is no longer accepted by XHS; this service
-backports only the upstream Creator CAS requests while keeping the publishing
-client pinned. Polling state, including the temporary login cookies required to
-resume after a container restart, is stored in `qr_state.json`. Expired or
-rejected QR attempts return `expired: true` and are removed so the next
-`/login/qr` call starts cleanly.
+QR creation uses the normal international creator login endpoints observed on
+the first-party `creator.rednote.com/login` page:
+`webapi.rednote.com/api/sns/web/v1/login/qrcode/create` and `/status`. The same
+paths on the pinned client's domestic default host are rejected, while the
+Creator CAS endpoint targets the merchant/Qianfan identity surface and is not
+used. Polling state, including the temporary login cookies required to resume
+after a container restart, is stored in `qr_state.json`. Expired or rejected QR
+attempts return `expired: true` and are removed so the next `/login/qr` call
+starts cleanly.
 
 Every `/login/qr` request replaces prior state and generates a new anonymous
 browser identity, avoiding the hard-coded cookies in `xhs==0.2.13`. Reused or
-already-expired CAS QR IDs are retried once and never persisted. When CAS
+already-expired QR IDs are retried once and never persisted. When Rednote
 provides expiration metadata, the service honors second or millisecond
 timestamps, second durations, or explicitly millisecond-suffixed durations
 with a safety margin; otherwise it uses the two-minute fallback. Rejected IDs
-remain blocked for five minutes. QR and status responses always include
-`Cache-Control: no-store`.
+remain blocked across restarts for five minutes. QR and status responses always
+include `Cache-Control: no-store`.
 
-If XHS rejects the Creator CAS flow, the endpoint returns a sanitized 502
+If Rednote rejects the creator QR flow, the endpoint returns a sanitized 502
 without cookies, tickets, or tracebacks. Use the existing authenticated
 `POST /login/cookie` operation as the manual fallback; no Railway environment
-or volume change is required.
+or volume change is required. Its JSON `cookie` field accepts only the value of
+an authenticated browser request's `Cookie` header:
+
+```json
+{"cookie": "a1=<value>; web_session=<value>; id_token=<value>"}
+```
+
+Do not paste a DevTools cookie table export; domain, path, expiry, and other
+columns are rejected. Cookies copied from a fresh authenticated
+`creator.rednote.com` request are supported: the client receives the name/value
+pairs directly and preserves values such as `id_token`. Both `a1` and
+`web_session` are required. Cookie values are never logged or returned, and
+invalid-session responses are sanitized.
 
 ## Publishing Flow
 
