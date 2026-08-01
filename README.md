@@ -107,6 +107,15 @@ Requests cookie-jar domain and path filtering. Supplemental defaults never
 replace submitted cookie names. Both `a1` and `web_session` are required.
 Cookie values and names are never logged or returned.
 
+In DevTools, open Network, select a fresh authenticated Creator request, and
+find `cookie` under Request Headers. Right-click the request-header **value**
+and choose **Copy value**. Never use **Copy all**, **Copy request headers**,
+**Copy as cURL**, or a cookie table export. A genuine browser Cookie Request
+Header value is one single-line, semicolon-separated sequence of unique valid
+names with the required session fields; ordinary percent-encoded and braced
+values are accepted. A parser 400 therefore indicates a copy artifact or other
+malformed input, not a Rednote validation result.
+
 Cookie ingestion failures return HTTP 400 in FastAPI's existing `detail`
 envelope with only a stable code and fixed safe message:
 
