@@ -122,7 +122,13 @@ REMOTE_VIDEO_TIMEOUT = httpx.Timeout(
 )
 
 # --- Persistent client (singleton) ---
-client: XhsClient | None = None
+@dataclass(frozen=True)
+class ActiveClientState:
+    client: XhsClient
+    canonical_cookie: str
+
+
+_active_client_state: ActiveClientState | None = None
 
 
 def require_api_key(x_api_key: str | None):
@@ -296,13 +302,29 @@ def save_cookie(cookie_str: str):
         Path(temp_path).unlink(missing_ok=True)
 
 
+def _get_client_snapshot_locked() -> tuple[XhsClient, str]:
+    global _active_client_state
+    if _active_client_state is None:
+        canonical_cookie = load_cookie()
+        _active_client_state = ActiveClientState(
+            client=_new_creator_client(canonical_cookie or None),
+            canonical_cookie=canonical_cookie,
+        )
+    return (
+        _active_client_state.client,
+        _active_client_state.canonical_cookie,
+    )
+
+
+def get_client_snapshot() -> tuple[XhsClient, str]:
+    """Return one consistent active client and canonical Cookie header pair."""
+    with CLIENT_LOCK:
+        return _get_client_snapshot_locked()
+
+
 def get_client() -> XhsClient:
     """Get or create the persistent XhsClient singleton."""
-    global client
-    with CLIENT_LOCK:
-        if client is None:
-            client = _new_creator_client(load_cookie())
-    return client
+    return get_client_snapshot()[0]
 
 
 def _add_international_cookies(xhs_client):
@@ -330,10 +352,13 @@ def _add_international_cookies(xhs_client):
 
 
 def _save_and_swap_client(cookie: str, replacement: XhsClient):
-    global client
+    global _active_client_state
     with CLIENT_LOCK:
         save_cookie(cookie)
-        client = replacement
+        _active_client_state = ActiveClientState(
+            client=replacement,
+            canonical_cookie=cookie,
+        )
 
 
 def _clear_qr_state() -> None:
@@ -970,7 +995,14 @@ def login_with_cookie(req: CookieLoginRequest, x_api_key: str | None = Header(No
             status_code=401 if validation.relogin_required else 502,
             content=status,
         )
-    _save_and_swap_client(normalized_cookie, candidate)
+    try:
+        _save_and_swap_client(normalized_cookie, candidate)
+    except OSError as exc:
+        logger.error("Unable to persist Creator session")
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to persist Creator session.",
+        ) from exc
     return {"status": "ok", **status}
 
 
@@ -978,9 +1010,20 @@ def login_with_cookie(req: CookieLoginRequest, x_api_key: str | None = Header(No
 @app.get("/session/status")
 def session_status(x_api_key: str | None = Header(None)):
     require_api_key(x_api_key)
-    active_client = get_client()
+    active_client, canonical_cookie = get_client_snapshot()
+    if not canonical_cookie:
+        validation = CreatorSessionValidation(
+            valid=False,
+            error_code="creator_session_invalid",
+            relogin_required=True,
+        )
+    else:
+        validation = _validate_creator_session(
+            active_client,
+            canonical_cookie,
+        )
     return _session_status_payload(
-        _validate_creator_session(active_client, active_client.cookie),
+        validation,
         "active_session",
     )
 

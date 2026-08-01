@@ -115,8 +115,10 @@ metadata is persisted and installed. Supported success metadata is the Creator
 contract's top-level `success: true` with `code: 0`, its nested
 `data.result.success: true`, or both when they agree. Conflicting, partial, or
 malformed success indicators are rejected; there is no fallback acceptance. A
-failed replacement leaves the prior cookie file and active publishing client
-intact.
+failed replacement leaves the prior cookie file and active publishing session
+intact. A successful replacement atomically installs the validated client
+together with the exact normalized Cookie header that was persisted; a
+persistence failure installs neither value.
 
 Redirects, HTTP 401/403, and XHS session-expired result `-100` return HTTP 401
 with `creator_session_invalid`, `relogin_required: true`, and a sanitized
@@ -127,8 +129,15 @@ Transport failures, 5xx responses, malformed payloads, and unexpected success
 shapes return sanitized HTTP 502 `creator_session_validation_unavailable`
 without replacing the session.
 
-`GET /session/status` uses the same Creator upload-permit boundary and returns
-stable sanitized metadata without forwarding the permit payload:
+`GET /session/status` snapshots the active client and its paired canonical
+Cookie header under one lock, then releases the lock before using that exact
+header at the same Creator upload-permit boundary. It never reconstructs the
+validated header from the client's cookie jar, whose defaults and serialization
+may differ. Concurrent login and status requests therefore observe either the
+complete prior session or the complete replacement session. If no cookie has
+been persisted, status reports an invalid session requiring login without
+making an upstream validation request. Responses contain stable sanitized
+metadata without forwarding the permit payload:
 
 ```json
 {
