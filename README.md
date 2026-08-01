@@ -93,6 +93,13 @@ Requests cookie-jar domain and path filtering. Supplemental defaults never
 replace submitted cookie names. Both `a1` and `web_session` are required.
 Cookie values and names are never logged or returned.
 
+The copied Request Header may contain pairs selected by the browser from both
+`.rednote.com` and `creator.rednote.com` scopes, including host-specific
+anti-bot state. The service retains every validated pair in submitted order
+when constructing the validation request. Because a plain Cookie header does
+not carry domain/path scope, duplicate names are ambiguous and rejected rather
+than silently choosing one value. DevTools table exports remain unsupported.
+
 A submitted cookie is validated through the signed Creator upload-permit GET
 confirmed by the authenticated browser flow:
 

@@ -221,6 +221,7 @@ def load_cookie() -> str:
 
 
 def _parse_cookie_header(cookie_header: str) -> dict[str, str]:
+    """Validate unique Cookie pairs while retaining submitted pair order."""
     if not cookie_header or not cookie_header.strip():
         raise ValueError("Cookie header is empty")
     if len(cookie_header.encode("utf-8")) > MAX_COOKIE_HEADER_BYTES:
@@ -249,6 +250,7 @@ def _parse_cookie_header(cookie_header: str) -> dict[str, str]:
 
 
 def _cookie_header_string(cookies: dict[str, str]) -> str:
+    """Serialize validated pairs in insertion order without dropping names."""
     return "; ".join(f"{name}={value}" for name, value in cookies.items())
 
 

@@ -114,6 +114,11 @@ class CookieLoginRouteTests(unittest.TestCase):
 
     def test_accepts_only_creator_valid_cookie_and_preserves_equals_in_value(self):
         candidate = object()
+        submitted_cookie = (
+            "creator_antibot=host-scoped-synthetic; "
+            "a1=fresh-a1; domain_state=domain-scoped-synthetic; "
+            "web_session=session-with-padding==; webId=browser-id"
+        )
         with (
             patch.object(
                 main,
@@ -124,26 +129,26 @@ class CookieLoginRouteTests(unittest.TestCase):
                 main,
                 "_validate_creator_session",
                 return_value=main.CreatorSessionValidation(valid=True),
-            ),
+            ) as validate,
             patch.object(main, "_save_and_swap_client") as save_and_swap,
         ):
             response = self.client.post(
                 "/login/cookie",
                 headers=self.headers,
-                json={
-                    "cookie": (
-                        "a1=fresh-a1; web_session=session-with-padding==; "
-                        "webId=browser-id"
-                    )
-                },
+                json={"cookie": submitted_cookie},
             )
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["valid"], True)
-        save_and_swap.assert_called_once_with(
-            "a1=fresh-a1; web_session=session-with-padding==; webId=browser-id",
-            candidate,
-        )
+        validate.assert_called_once_with(candidate, submitted_cookie)
+        save_and_swap.assert_called_once_with(submitted_cookie, candidate)
+        for cookie_value in (
+            "host-scoped-synthetic",
+            "domain-scoped-synthetic",
+            "fresh-a1",
+            "session-with-padding==",
+        ):
+            self.assertNotIn(cookie_value, response.text)
 
     def test_nested_creator_permit_response_returns_only_sanitized_status(self):
         candidate = object()
@@ -234,6 +239,30 @@ class CookieLoginRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertIn("a1 and web_session", response.json()["detail"])
+
+    def test_rejects_duplicate_cookie_names_without_selecting_a_value(self):
+        with (
+            patch.object(main, "_new_creator_client") as new_client,
+            patch.object(main, "_validate_creator_session") as validate,
+            patch.object(main, "_save_and_swap_client") as save_and_swap,
+        ):
+            response = self.client.post(
+                "/login/cookie",
+                headers=self.headers,
+                json={
+                    "cookie": (
+                        "a1=first-synthetic; creator_antibot=synthetic; "
+                        "a1=second-synthetic; web_session=synthetic"
+                    )
+                },
+            )
+
+        self.assertEqual(response.status_code, 400)
+        new_client.assert_not_called()
+        validate.assert_not_called()
+        save_and_swap.assert_not_called()
+        self.assertNotIn("first-synthetic", response.text)
+        self.assertNotIn("second-synthetic", response.text)
 
     def test_cookie_login_requires_api_key_before_parsing(self):
         response = self.client.post(
@@ -637,8 +666,14 @@ class CreatorSessionValidationTests(unittest.TestCase):
                 pass
 
         cookie_header = (
-            "a1=signing-cookie; web_session=authenticated-session; "
+            "creator_antibot=host-scoped-synthetic; "
+            "a1=signing-cookie; domain_state=domain-scoped-synthetic; "
+            "web_session=authenticated-session; "
             "webId=submitted-browser; path_scoped=submitted-value"
+        )
+        self.assertEqual(
+            main._cookie_header_string(main._parse_cookie_header(cookie_header)),
+            cookie_header,
         )
         candidate = main._new_creator_client(cookie_header)
         candidate.session.cookies.clear()
@@ -662,15 +697,19 @@ class CreatorSessionValidationTests(unittest.TestCase):
         ]
         adapter = RecordingAdapter()
         candidate.session.mount("https://", adapter)
-        with patch.object(
-            main,
-            "creator_sign",
-            return_value={
-                "x-s": "signed",
-                "x-t": "time",
-                "x-s-common": "common",
-            },
-        ) as creator_sign:
+        with (
+            patch.object(
+                main,
+                "creator_sign",
+                return_value={
+                    "x-s": "signed",
+                    "x-t": "time",
+                    "x-s-common": "common",
+                },
+            ) as creator_sign,
+            patch.object(main.logger, "info") as log_info,
+            patch.object(main.logger, "warning") as log_warning,
+        ):
             validation = main._validate_creator_session(
                 candidate,
                 cookie_header,
@@ -697,6 +736,15 @@ class CreatorSessionValidationTests(unittest.TestCase):
         self.assertEqual(request.method, "GET")
         self.assertEqual(request.headers["Cookie"], cookie_header)
         self.assertNotIn("jar-only", request.headers["Cookie"])
+        log_info.assert_not_called()
+        log_warning.assert_not_called()
+        for cookie_value in (
+            "host-scoped-synthetic",
+            "domain-scoped-synthetic",
+            "signing-cookie",
+            "authenticated-session",
+        ):
+            self.assertNotIn(cookie_value, repr(validation))
         self.assertEqual(request.headers["Origin"], main.REDNOTE_CREATOR_HOST)
         self.assertEqual(
             request.headers["Referer"],
