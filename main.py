@@ -17,12 +17,16 @@ import re
 import time
 import uuid
 import shutil
+import threading
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 import httpx
+import requests
 from xhs import XhsClient
+from xhs.help import sign as creator_sign
 from xhshow import Xhshow
 from sign_service import sign
 
@@ -78,6 +82,10 @@ QR_NO_STORE_HEADERS = {
     "Pragma": "no-cache",
     "Expires": "0",
 }
+CLIENT_LOCK = threading.Lock()
+REDNOTE_CREATOR_HOST = "https://creator.rednote.com"
+REDNOTE_CREATOR_PROFILE_PATH = "/api/galaxy/creator/home/personal_info"
+XHS_SESSION_EXPIRED_RESULT = -100
 UPLOAD_TOKEN_MAX_LIFETIME_SECONDS = 5 * 60
 BASE64URL_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 COOKIE_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
@@ -244,6 +252,20 @@ def _new_xhs_client(cookie: str | None = None) -> XhsClient:
     return xhs_client
 
 
+def _new_creator_client(cookie: str | None = None) -> XhsClient:
+    xhs_client = _new_xhs_client(cookie)
+    xhs_client._host = "https://webapi.rednote.com"
+    xhs_client._creator_host = REDNOTE_CREATOR_HOST
+    xhs_client.home = REDNOTE_CREATOR_HOST
+    xhs_client.session.headers.update({
+        "Origin": REDNOTE_CREATOR_HOST,
+        "Referer": f"{REDNOTE_CREATOR_HOST}/publish/publish",
+    })
+    _add_international_cookies(xhs_client)
+    _patch_international_urls(xhs_client)
+    return xhs_client
+
+
 def save_cookie(cookie_str: str):
     os.makedirs(DATA_DIR, exist_ok=True)
     temp_path = f"{COOKIE_FILE}.{uuid.uuid4().hex}.tmp"
@@ -263,22 +285,9 @@ def save_cookie(cookie_str: str):
 def get_client() -> XhsClient:
     """Get or create the persistent XhsClient singleton."""
     global client
-    if client is None:
-        cookie = load_cookie()
-        client = _new_xhs_client(cookie)
-        # For international RedNote accounts:
-        # - _host → webapi.rednote.com (found in publish-components JS)
-        # - _creator_host → creator.rednote.com
-        client._host = "https://webapi.rednote.com"
-        client._creator_host = "https://creator.rednote.com"
-        client.home = "https://creator.rednote.com"
-        client.session.headers.update({
-            "Origin": "https://creator.rednote.com",
-            "Referer": "https://creator.rednote.com/publish/publish",
-        })
-        # Add required cookies for international accounts (discovered from browser DevTools)
-        _add_international_cookies(client)
-        _patch_international_urls(client)
+    with CLIENT_LOCK:
+        if client is None:
+            client = _new_creator_client(load_cookie())
     return client
 
 
@@ -301,20 +310,11 @@ def _add_international_cookies(xhs_client):
         xhs_client.session.cookies.set(name, value, domain=domain)
 
 
-def refresh_client():
-    """Force-rebuild client (e.g., after QR login succeeds)."""
+def _save_and_swap_client(cookie: str, replacement: XhsClient):
     global client
-    cookie = load_cookie()
-    client = _new_xhs_client(cookie)
-    client._host = "https://webapi.rednote.com"
-    client._creator_host = "https://creator.rednote.com"
-    client.home = "https://creator.rednote.com"
-    client.session.headers.update({
-        "Origin": "https://creator.rednote.com",
-        "Referer": "https://creator.rednote.com/publish/publish",
-    })
-    _add_international_cookies(client)
-    _patch_international_urls(client)
+    with CLIENT_LOCK:
+        save_cookie(cookie)
+        client = replacement
 
 
 def _clear_qr_state() -> None:
@@ -668,6 +668,107 @@ class CookieLoginRequest(BaseModel):
     cookie: str
 
 
+@dataclass(frozen=True)
+class CreatorSessionValidation:
+    valid: bool
+    error_code: str | None = None
+    relogin_required: bool = False
+
+
+def _request_creator_profile(xhs_client: XhsClient) -> requests.Response:
+    signed_headers = creator_sign(
+        REDNOTE_CREATOR_PROFILE_PATH,
+        a1=xhs_client.cookie_dict.get("a1", ""),
+    )
+    return xhs_client.session.get(
+        f"{REDNOTE_CREATOR_HOST}{REDNOTE_CREATOR_PROFILE_PATH}",
+        headers=signed_headers,
+        timeout=xhs_client.timeout,
+        proxies=xhs_client.proxies,
+        allow_redirects=False,
+    )
+
+
+def _validate_creator_session(
+    xhs_client: XhsClient,
+) -> CreatorSessionValidation:
+    try:
+        response = _request_creator_profile(xhs_client)
+    except requests.RequestException:
+        return CreatorSessionValidation(
+            valid=False,
+            error_code="creator_session_validation_unavailable",
+        )
+
+    if response.is_redirect or response.is_permanent_redirect:
+        return CreatorSessionValidation(
+            valid=False,
+            error_code="creator_session_invalid",
+            relogin_required=True,
+        )
+    if response.status_code in {401, 403}:
+        return CreatorSessionValidation(
+            valid=False,
+            error_code="creator_session_invalid",
+            relogin_required=True,
+        )
+    if not 200 <= response.status_code < 300:
+        return CreatorSessionValidation(
+            valid=False,
+            error_code="creator_session_validation_unavailable",
+        )
+
+    try:
+        payload = response.json()
+    except requests.exceptions.JSONDecodeError:
+        return CreatorSessionValidation(
+            valid=False,
+            error_code="creator_session_validation_unavailable",
+        )
+
+    if isinstance(payload, dict) and payload.get("success") is True:
+        return CreatorSessionValidation(valid=True)
+    if isinstance(payload, dict) and (
+        payload.get("result") == XHS_SESSION_EXPIRED_RESULT
+        or payload.get("code") == XHS_SESSION_EXPIRED_RESULT
+    ):
+        return CreatorSessionValidation(
+            valid=False,
+            error_code="creator_session_invalid",
+            relogin_required=True,
+        )
+    return CreatorSessionValidation(
+        valid=False,
+        error_code="creator_session_validation_unavailable",
+    )
+
+
+def _session_status_payload(
+    validation: CreatorSessionValidation,
+) -> dict:
+    result = {
+        "valid": validation.valid,
+        "session_type": "rednote_creator",
+        "validation": {
+            "method": "creator_profile",
+            "host": "creator.rednote.com",
+            "path": REDNOTE_CREATOR_PROFILE_PATH,
+        },
+        "relogin_required": validation.relogin_required,
+    }
+    if validation.error_code:
+        message = (
+            "Creator session is not authenticated; re-login is required."
+            if validation.relogin_required
+            else "Creator session validation is temporarily unavailable."
+        )
+        result["error"] = {
+            "code": validation.error_code,
+            "message": message,
+        }
+    return result
+
+
 @app.post("/login/cookie")
 def login_with_cookie(req: CookieLoginRequest, x_api_key: str | None = Header(None)):
     require_api_key(x_api_key)
@@ -690,21 +791,24 @@ def login_with_cookie(req: CookieLoginRequest, x_api_key: str | None = Header(No
                 "cookies from a fresh authenticated Creator request."
             ),
         )
-    save_cookie(_cookie_header_string(cookies))
-    refresh_client()
-    return {"status": "ok", "message": "Cookie saved. Use /session/status to verify."}
+    normalized_cookie = _cookie_header_string(cookies)
+    candidate = _new_creator_client(normalized_cookie)
+    validation = _validate_creator_session(candidate)
+    status = _session_status_payload(validation)
+    if not validation.valid:
+        return JSONResponse(
+            status_code=401 if validation.relogin_required else 502,
+            content=status,
+        )
+    _save_and_swap_client(normalized_cookie, candidate)
+    return {"status": "ok", **status}
 
 
 # --- Session Health ---
 @app.get("/session/status")
 def session_status(x_api_key: str | None = Header(None)):
     require_api_key(x_api_key)
-    xhs = get_client()
-    try:
-        info = xhs.get_self_info()
-        return {"valid": True, "user_info": info}
-    except Exception:
-        return {"valid": False, "error": "Session validation failed"}
+    return _session_status_payload(_validate_creator_session(get_client()))
 
 
 # --- File Upload ---

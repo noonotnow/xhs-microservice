@@ -107,11 +107,25 @@ class CookieLoginRouteTests(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(main.app)
         self.headers = {"X-Api-Key": main.API_KEY}
+        self.original_client = main.client
 
-    def test_accepts_cookie_header_and_preserves_equals_in_value(self):
+    def tearDown(self):
+        main.client = self.original_client
+
+    def test_accepts_only_creator_valid_cookie_and_preserves_equals_in_value(self):
+        candidate = object()
         with (
-            patch.object(main, "save_cookie") as save_cookie,
-            patch.object(main, "refresh_client") as refresh_client,
+            patch.object(
+                main,
+                "_new_creator_client",
+                return_value=candidate,
+            ),
+            patch.object(
+                main,
+                "_validate_creator_session",
+                return_value=main.CreatorSessionValidation(valid=True),
+            ),
+            patch.object(main, "_save_and_swap_client") as save_and_swap,
         ):
             response = self.client.post(
                 "/login/cookie",
@@ -125,10 +139,11 @@ class CookieLoginRouteTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        save_cookie.assert_called_once_with(
-            "a1=fresh-a1; web_session=session-with-padding==; webId=browser-id"
+        self.assertEqual(response.json()["valid"], True)
+        save_and_swap.assert_called_once_with(
+            "a1=fresh-a1; web_session=session-with-padding==; webId=browser-id",
+            candidate,
         )
-        refresh_client.assert_called_once_with()
 
     def test_rejects_devtools_table_export_without_echoing_input(self):
         response = self.client.post(
@@ -170,15 +185,66 @@ class CookieLoginRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 403)
 
+    def test_creator_redirect_does_not_persist_or_replace_working_client(self):
+        working_client = object()
+        candidate = object()
+        main.client = working_client
+        validation = main.CreatorSessionValidation(
+            valid=False,
+            error_code="creator_session_invalid",
+            relogin_required=True,
+        )
+        with (
+            patch.object(
+                main,
+                "_new_creator_client",
+                return_value=candidate,
+            ),
+            patch.object(
+                main,
+                "_validate_creator_session",
+                return_value=validation,
+            ),
+            patch.object(main, "_save_and_swap_client") as save_and_swap,
+        ):
+            response = self.client.post(
+                "/login/cookie",
+                headers=self.headers,
+                json={"cookie": "a1=new-secret; web_session=new-session"},
+            )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["valid"], False)
+        self.assertEqual(response.json()["relogin_required"], True)
+        self.assertEqual(
+            response.json()["error"]["code"],
+            "creator_session_invalid",
+        )
+        save_and_swap.assert_not_called()
+        self.assertIs(main.client, working_client)
+        self.assertNotIn("new-secret", response.text)
+        self.assertNotIn("new-session", response.text)
+
     def test_session_failure_does_not_return_upstream_payload(self):
         upstream_error = "cookie=must-not-escape"
-        with patch.object(
-            main,
-            "get_client",
-            return_value=types.SimpleNamespace(
-                get_self_info=lambda: (_ for _ in ()).throw(
-                    RuntimeError(upstream_error)
-                )
+        response_payload = {
+            "success": False,
+            "code": -1,
+            "result": -100,
+            "msg": upstream_error,
+        }
+        upstream_response = types.SimpleNamespace(
+            is_redirect=False,
+            is_permanent_redirect=False,
+            status_code=200,
+            json=lambda: response_payload,
+        )
+        with (
+            patch.object(main, "get_client", return_value=object()),
+            patch.object(
+                main,
+                "_request_creator_profile",
+                return_value=upstream_response,
             ),
         ):
             response = self.client.get(
@@ -186,11 +252,53 @@ class CookieLoginRouteTests(unittest.TestCase):
                 headers=self.headers,
             )
 
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["valid"], False)
+        self.assertEqual(response.json()["relogin_required"], True)
         self.assertEqual(
-            response.json(),
-            {"valid": False, "error": "Session validation failed"},
+            response.json()["error"]["code"],
+            "creator_session_invalid",
         )
         self.assertNotIn(upstream_error, response.text)
+
+    def test_cookie_login_and_status_share_creator_validation_contract(self):
+        candidate = object()
+        validation = main.CreatorSessionValidation(valid=True)
+        with (
+            patch.object(
+                main,
+                "_new_creator_client",
+                return_value=candidate,
+            ),
+            patch.object(
+                main,
+                "_validate_creator_session",
+                return_value=validation,
+            ),
+            patch.object(main, "get_client", return_value=candidate),
+            patch.object(main, "_save_and_swap_client") as save_and_swap,
+        ):
+            login_response = self.client.post(
+                "/login/cookie",
+                headers=self.headers,
+                json={"cookie": "a1=fresh; web_session=fresh"},
+            )
+            status_response = self.client.get(
+                "/session/status",
+                headers=self.headers,
+            )
+
+        save_and_swap.assert_called_once()
+        for key in (
+            "valid",
+            "session_type",
+            "validation",
+            "relogin_required",
+        ):
+            self.assertEqual(
+                login_response.json()[key],
+                status_response.json()[key],
+            )
 
     def test_saved_cookie_file_is_private_and_old_file_is_tightened(self):
         with tempfile.TemporaryDirectory() as data_dir:
@@ -208,6 +316,75 @@ class CookieLoginRouteTests(unittest.TestCase):
                     "a1=fresh; web_session=fresh",
                 )
                 self.assertEqual(os.stat(cookie_file).st_mode & 0o777, 0o600)
+
+
+class CreatorSessionValidationTests(unittest.TestCase):
+    def test_uses_signed_creator_profile_without_legacy_self_check(self):
+        response = types.SimpleNamespace(
+            is_redirect=False,
+            is_permanent_redirect=False,
+            status_code=200,
+            json=lambda: {"success": True, "data": {"name": "creator"}},
+        )
+
+        class Session:
+            def __init__(self):
+                self.calls = []
+
+            def get(self, url, **kwargs):
+                self.calls.append((url, kwargs))
+                return response
+
+        session = Session()
+        candidate = types.SimpleNamespace(
+            cookie_dict={"a1": "signing-cookie"},
+            session=session,
+            timeout=10,
+            proxies=None,
+            get_self_info=lambda: self.fail("legacy self check was used"),
+        )
+        with patch.object(
+            main,
+            "creator_sign",
+            return_value={"x-s": "signed", "x-t": "time", "x-s-common": "common"},
+        ) as creator_sign:
+            validation = main._validate_creator_session(candidate)
+
+        self.assertEqual(validation, main.CreatorSessionValidation(valid=True))
+        creator_sign.assert_called_once_with(
+            main.REDNOTE_CREATOR_PROFILE_PATH,
+            a1="signing-cookie",
+        )
+        self.assertEqual(
+            session.calls[0][0],
+            (
+                "https://creator.rednote.com"
+                "/api/galaxy/creator/home/personal_info"
+            ),
+        )
+        self.assertEqual(session.calls[0][1]["allow_redirects"], False)
+
+    def test_login_redirect_is_classified_as_relogin_required(self):
+        redirect = types.SimpleNamespace(
+            is_redirect=True,
+            is_permanent_redirect=False,
+            status_code=302,
+        )
+        with patch.object(
+            main,
+            "_request_creator_profile",
+            return_value=redirect,
+        ):
+            validation = main._validate_creator_session(object())
+
+        self.assertEqual(
+            validation,
+            main.CreatorSessionValidation(
+                valid=False,
+                error_code="creator_session_invalid",
+                relogin_required=True,
+            ),
+        )
 
 
 class RemoteVideoDownloadTests(unittest.IsolatedAsyncioTestCase):

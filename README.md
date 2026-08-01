@@ -21,6 +21,7 @@ Real Xiaohongshu API
 | GET | `/health` | Health check |
 | GET | `/login/qr` | Start QR login flow, returns QR data |
 | GET | `/login/status` | Check QR scan status, saves session on success |
+| POST | `/login/cookie` | Validate and save a Creator request cookie |
 | GET | `/session/status` | Check if current session is valid |
 | POST | `/upload` | Upload an image file (returns local path) |
 | POST | `/publish` | Publish or schedule a note |
@@ -90,7 +91,30 @@ columns are rejected. Cookies copied from a fresh authenticated
 name/value pairs directly, so they do not have to originate from a
 `xiaohongshu.com` domain. Both `a1` and `web_session` are required. Cookie
 values are never logged or returned, and invalid-session responses are
-sanitized.
+sanitized. A submitted cookie is first validated with the read-only signed
+Creator profile request
+`GET https://creator.rednote.com/api/galaxy/creator/home/personal_info`.
+Only a successful Creator response is persisted and installed; a failed
+replacement leaves the prior cookie file and active publishing client intact.
+Login redirects and XHS result `-100` return HTTP 401 with
+`creator_session_invalid` and `relogin_required: true`. Temporary upstream
+validation failures return HTTP 502 without replacing the session.
+
+`GET /session/status` uses the same Creator profile boundary and returns stable
+sanitized metadata without forwarding the profile payload:
+
+```json
+{
+  "valid": true,
+  "session_type": "rednote_creator",
+  "validation": {
+    "method": "creator_profile",
+    "host": "creator.rednote.com",
+    "path": "/api/galaxy/creator/home/personal_info"
+  },
+  "relogin_required": false
+}
+```
 
 ## Publishing Flow
 
