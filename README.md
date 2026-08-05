@@ -85,6 +85,20 @@ authenticated browser request's `Cookie` header:
 {"cookie": "a1=<value>; web_session=<value>; webId=<value>"}
 ```
 
+Pasting the full Request Headers line is also supported: a single
+case-insensitive leading `Cookie:` label, outer spaces, and one trailing copied
+newline are removed before validation. Pair order is retained. Embedded
+newlines, additional headers, tabs, other control characters, malformed pairs,
+invalid or duplicate names, unsupported values, and oversized inputs are
+rejected before client creation, signing, validation, or persistence.
+
+Names are limited to the ASCII HTTP token characters accepted by the parser.
+Values must be representable as ISO-8859-1 (the exact Requests header
+transmission boundary) and must not contain Unicode control characters.
+Characters outside U+0000-U+00FF are rejected; control characters within that
+range are also rejected. A semicolon remains the pair delimiter rather than
+part of a value.
+
 Do not paste a DevTools cookie table export; domain, path, expiry, and other
 columns are rejected. Cookies copied from a fresh authenticated
 `creator.rednote.com` request are supported: the pinned client receives the
@@ -92,6 +106,38 @@ name/value pairs as an explicit request-local `Cookie` header, bypassing
 Requests cookie-jar domain and path filtering. Supplemental defaults never
 replace submitted cookie names. Both `a1` and `web_session` are required.
 Cookie values and names are never logged or returned.
+
+In DevTools, open Network, select a fresh authenticated Creator request, and
+find `cookie` under Request Headers. Right-click the request-header **value**
+and choose **Copy value**. Never use **Copy all**, **Copy request headers**,
+**Copy as cURL**, or a cookie table export. A genuine browser Cookie Request
+Header value is one single-line, semicolon-separated sequence of unique valid
+names with the required session fields; ordinary percent-encoded and braced
+values are accepted. A parser 400 therefore indicates a copy artifact or other
+malformed input, not a Rednote validation result.
+
+Cookie ingestion failures return HTTP 400 in FastAPI's existing `detail`
+envelope with only a stable code and fixed safe message:
+
+```json
+{
+  "detail": {
+    "code": "cookie_header_control_character",
+    "message": "Cookie request header contains an unsupported control character."
+  }
+}
+```
+
+Parse codes are `cookie_header_control_character`,
+`cookie_header_invalid_name`, `cookie_header_invalid_value`,
+`cookie_header_duplicate_name`, `cookie_header_missing_equals`,
+`cookie_header_too_large`, and `cookie_header_empty`. Missing or non-string
+`cookie` fields and malformed JSON use `cookie_header_invalid_type` instead of
+FastAPI's input-reflecting validation response. A syntactically valid header
+without the required non-empty Creator session fields returns
+`cookie_required_session_fields`. These responses never include submitted
+names, values, lengths, raw input, headers, validation details, exception text,
+or upstream details.
 
 The copied Request Header may contain pairs selected by the browser from both
 `.rednote.com` and `creator.rednote.com` scopes, including host-specific
