@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from contextlib import redirect_stdout
@@ -188,10 +189,10 @@ class CookieLoginRouteTests(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(main.app)
         self.headers = {"X-Api-Key": main.API_KEY}
-        self.original_client = main.client
+        self.original_active_client_state = main._active_client_state
 
     def tearDown(self):
-        main.client = self.original_client
+        main._active_client_state = self.original_active_client_state
 
     def assert_cookie_parse_failure(
         self,
@@ -201,7 +202,11 @@ class CookieLoginRouteTests(unittest.TestCase):
         request_kwargs=None,
     ):
         working_client = object()
-        main.client = working_client
+        working_cookie = "a1=working-secret; web_session=working-session"
+        main._active_client_state = main.ActiveClientState(
+            working_client,
+            working_cookie,
+        )
         stdout = io.StringIO()
         if request_kwargs is None:
             request_kwargs = {"json": {"cookie": submitted_cookie}}
@@ -245,7 +250,10 @@ class CookieLoginRouteTests(unittest.TestCase):
         log_info.assert_not_called()
         log_warning.assert_not_called()
         log_error.assert_not_called()
-        self.assertIs(main.client, working_client)
+        self.assertEqual(
+            main.get_client_snapshot(),
+            (working_client, working_cookie),
+        )
         output = " ".join((response.text, stdout.getvalue()))
         for canary in canaries:
             self.assertNotIn(canary, output)
@@ -549,6 +557,51 @@ class CookieLoginRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 422)
         self.assertIsInstance(response.json()["detail"], list)
 
+    def test_rejects_duplicate_cookie_names_without_selecting_a_value(self):
+        working_client = object()
+        working_cookie = "a1=working-secret; web_session=working-session"
+        main._active_client_state = main.ActiveClientState(
+            working_client,
+            working_cookie,
+        )
+        with tempfile.TemporaryDirectory() as data_dir:
+            cookie_file = os.path.join(data_dir, "cookie.json")
+            with (
+                patch.object(main, "DATA_DIR", data_dir),
+                patch.object(main, "COOKIE_FILE", cookie_file),
+            ):
+                main.save_cookie(working_cookie)
+                with (
+                    patch.object(main, "_new_creator_client") as new_client,
+                    patch.object(main, "_validate_creator_session") as validate,
+                    patch.object(main, "_save_and_swap_client") as save_and_swap,
+                ):
+                    response = self.client.post(
+                        "/login/cookie",
+                        headers=self.headers,
+                        json={
+                            "cookie": (
+                                "a1=first-synthetic; "
+                                "creator_antibot=synthetic; "
+                                "a1=second-synthetic; "
+                                "web_session=synthetic"
+                            )
+                        },
+                    )
+                persisted_cookie = main.load_cookie()
+
+        self.assertEqual(response.status_code, 400)
+        new_client.assert_not_called()
+        validate.assert_not_called()
+        save_and_swap.assert_not_called()
+        self.assertEqual(persisted_cookie, working_cookie)
+        self.assertEqual(
+            main.get_client_snapshot(),
+            (working_client, working_cookie),
+        )
+        self.assertNotIn("first-synthetic", response.text)
+        self.assertNotIn("second-synthetic", response.text)
+
     def test_cookie_login_requires_api_key_before_parsing(self):
         response = self.client.post(
             "/login/cookie",
@@ -560,7 +613,10 @@ class CookieLoginRouteTests(unittest.TestCase):
     def test_creator_redirect_does_not_persist_or_replace_working_client(self):
         working_client = object()
         candidate = object()
-        main.client = working_client
+        main._active_client_state = main.ActiveClientState(
+            working_client,
+            "a1=working-secret; web_session=working-session",
+        )
         validation = main.CreatorSessionValidation(
             valid=False,
             error_code="creator_session_invalid",
@@ -597,14 +653,17 @@ class CookieLoginRouteTests(unittest.TestCase):
         self.assertEqual(response.json()["error"]["reason"], "redirect")
         self.assertEqual(response.json()["error"]["upstream_status"], 302)
         save_and_swap.assert_not_called()
-        self.assertIs(main.client, working_client)
+        self.assertIs(main._active_client_state.client, working_client)
         self.assertNotIn("new-secret", response.text)
         self.assertNotIn("new-session", response.text)
 
     def test_validation_unavailable_does_not_persist_or_replace_working_client(self):
         working_client = object()
         candidate = object()
-        main.client = working_client
+        main._active_client_state = main.ActiveClientState(
+            working_client,
+            "a1=working-secret; web_session=working-session",
+        )
         validation = main.CreatorSessionValidation(
             valid=False,
             error_code="creator_session_validation_unavailable",
@@ -634,14 +693,17 @@ class CookieLoginRouteTests(unittest.TestCase):
             "creator_session_validation_unavailable",
         )
         save_and_swap.assert_not_called()
-        self.assertIs(main.client, working_client)
+        self.assertIs(main._active_client_state.client, working_client)
         self.assertNotIn("new-secret", response.text)
         self.assertNotIn("new-session", response.text)
 
     def test_conflicting_candidate_response_preserves_prior_session_atomically(self):
         working_client = object()
         candidate = object()
-        main.client = working_client
+        main._active_client_state = main.ActiveClientState(
+            working_client,
+            "a1=working-secret; web_session=working-session",
+        )
         upstream_marker = "synthetic-upstream-marker"
         response_payload = {
             "success": True,
@@ -703,7 +765,7 @@ class CookieLoginRouteTests(unittest.TestCase):
                 json.loads(Path(cookie_file).read_text())["cookie"],
                 "a1=prior-synthetic; web_session=prior-synthetic",
             )
-            self.assertIs(main.client, working_client)
+            self.assertIs(main._active_client_state.client, working_client)
             save_and_swap.assert_not_called()
             response_text = response.text
             log_text = " ".join(captured.output)
@@ -719,7 +781,10 @@ class CookieLoginRouteTests(unittest.TestCase):
     def test_failed_validation_preserves_cookie_file_and_active_client_atomically(self):
         working_client = object()
         candidate = object()
-        main.client = working_client
+        main._active_client_state = main.ActiveClientState(
+            working_client,
+            "a1=working-secret; web_session=working-session",
+        )
         failures = (
             (
                 main.CreatorSessionValidation(
@@ -778,7 +843,10 @@ class CookieLoginRouteTests(unittest.TestCase):
                         main.load_cookie(),
                         "a1=working-secret; web_session=working-session",
                     )
-                    self.assertIs(main.client, working_client)
+                    self.assertIs(
+                        main._active_client_state.client,
+                        working_client,
+                    )
                     save_and_swap.assert_not_called()
                     self.assertNotIn("replacement-secret", response.text)
                     self.assertNotIn("replacement-session", response.text)
@@ -800,9 +868,10 @@ class CookieLoginRouteTests(unittest.TestCase):
         with (
             patch.object(
                 main,
-                "get_client",
-                return_value=types.SimpleNamespace(
-                    cookie="a1=current; web_session=current"
+                "get_client_snapshot",
+                return_value=(
+                    object(),
+                    "a1=current; web_session=current",
                 ),
             ),
             patch.object(
@@ -833,8 +902,9 @@ class CookieLoginRouteTests(unittest.TestCase):
 
     def test_cookie_login_and_status_share_creator_validation_contract(self):
         candidate = types.SimpleNamespace(
-            cookie="a1=fresh; web_session=fresh"
+            cookie="webBuild=default; a1=jar-order; web_session=jar-order"
         )
+        canonical_cookie = "a1=fresh; web_session=fresh"
         validation = main.CreatorSessionValidation(valid=True)
         with (
             patch.object(
@@ -847,7 +917,11 @@ class CookieLoginRouteTests(unittest.TestCase):
                 "_validate_creator_session",
                 return_value=validation,
             ) as validate,
-            patch.object(main, "get_client", return_value=candidate),
+            patch.object(
+                main,
+                "get_client_snapshot",
+                return_value=(candidate, canonical_cookie),
+            ),
             patch.object(main, "_save_and_swap_client") as save_and_swap,
         ):
             login_response = self.client.post(
@@ -883,8 +957,268 @@ class CookieLoginRouteTests(unittest.TestCase):
             validate.call_args_list,
             [
                 unittest.mock.call(candidate, "a1=fresh; web_session=fresh"),
-                unittest.mock.call(candidate, candidate.cookie),
+                unittest.mock.call(candidate, canonical_cookie),
             ],
+        )
+        self.assertNotIn(canonical_cookie, status_response.text)
+        self.assertNotIn(candidate.cookie, status_response.text)
+
+    def test_lazy_startup_loads_one_paired_client_and_canonical_cookie(self):
+        canonical_cookie = (
+            "creator_state=host-scoped; a1=startup-a1; "
+            "web_session=startup-session"
+        )
+        startup_client = object()
+        with tempfile.TemporaryDirectory() as data_dir:
+            cookie_file = os.path.join(data_dir, "cookie.json")
+            with (
+                patch.object(main, "DATA_DIR", data_dir),
+                patch.object(main, "COOKIE_FILE", cookie_file),
+            ):
+                main.save_cookie(canonical_cookie)
+                main._active_client_state = None
+                with (
+                    patch.object(
+                        main,
+                        "load_cookie",
+                        wraps=main.load_cookie,
+                    ) as load_cookie,
+                    patch.object(
+                        main,
+                        "_new_creator_client",
+                        return_value=startup_client,
+                    ) as new_client,
+                ):
+                    first_snapshot = main.get_client_snapshot()
+                    second_snapshot = main.get_client_snapshot()
+                    publishing_client = main.get_client()
+
+        self.assertEqual(
+            first_snapshot,
+            (startup_client, canonical_cookie),
+        )
+        self.assertEqual(second_snapshot, first_snapshot)
+        self.assertIs(publishing_client, startup_client)
+        load_cookie.assert_called_once_with()
+        new_client.assert_called_once_with(canonical_cookie)
+
+    def test_empty_startup_session_is_paired_and_requires_relogin(self):
+        startup_client = object()
+        main._active_client_state = None
+        with tempfile.TemporaryDirectory() as data_dir:
+            with (
+                patch.object(main, "DATA_DIR", data_dir),
+                patch.object(
+                    main,
+                    "COOKIE_FILE",
+                    os.path.join(data_dir, "cookie.json"),
+                ),
+                patch.object(
+                    main,
+                    "_new_creator_client",
+                    return_value=startup_client,
+                ) as new_client,
+                patch.object(main, "_validate_creator_session") as validate,
+            ):
+                response = self.client.get(
+                    "/session/status",
+                    headers=self.headers,
+                )
+                snapshot = main.get_client_snapshot()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["valid"])
+        self.assertTrue(response.json()["relogin_required"])
+        self.assertEqual(
+            response.json()["validation"]["source"],
+            "active_session",
+        )
+        self.assertEqual(snapshot, (startup_client, ""))
+        new_client.assert_called_once_with(None)
+        validate.assert_not_called()
+
+    def test_persistence_failure_preserves_old_pair_and_cookie_file(self):
+        old_client = object()
+        candidate = object()
+        old_cookie = "a1=old-secret; web_session=old-session"
+        candidate_cookie = "a1=candidate-secret; web_session=candidate-session"
+        main._active_client_state = main.ActiveClientState(
+            old_client,
+            old_cookie,
+        )
+        with tempfile.TemporaryDirectory() as data_dir:
+            cookie_file = os.path.join(data_dir, "cookie.json")
+            with (
+                patch.object(main, "DATA_DIR", data_dir),
+                patch.object(main, "COOKIE_FILE", cookie_file),
+            ):
+                main.save_cookie(old_cookie)
+                with (
+                    patch.object(
+                        main,
+                        "_new_creator_client",
+                        return_value=candidate,
+                    ),
+                    patch.object(
+                        main,
+                        "_validate_creator_session",
+                        return_value=main.CreatorSessionValidation(valid=True),
+                    ),
+                    patch.object(
+                        main,
+                        "save_cookie",
+                        side_effect=OSError("candidate-secret"),
+                    ),
+                    patch.object(main.logger, "error") as log_error,
+                ):
+                    response = self.client.post(
+                        "/login/cookie",
+                        headers=self.headers,
+                        json={"cookie": candidate_cookie},
+                    )
+
+                persisted_cookie = json.loads(
+                    Path(cookie_file).read_text()
+                )["cookie"]
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(
+            response.json()["detail"],
+            "Unable to persist Creator session.",
+        )
+        self.assertEqual(persisted_cookie, old_cookie)
+        self.assertEqual(
+            main.get_client_snapshot(),
+            (old_client, old_cookie),
+        )
+        log_error.assert_called_once_with("Unable to persist Creator session")
+        output = f"{response.text} {log_error.call_args!r}"
+        self.assertNotIn("candidate-secret", output)
+        self.assertNotIn("candidate-session", output)
+        self.assertNotIn("old-secret", output)
+        self.assertNotIn("old-session", output)
+
+    def test_swap_and_snapshot_never_return_a_torn_pair(self):
+        old_client = object()
+        new_client = object()
+        old_cookie = "a1=old; web_session=old"
+        new_cookie = "a1=new; web_session=new"
+        main._active_client_state = main.ActiveClientState(
+            old_client,
+            old_cookie,
+        )
+        persist_barrier = threading.Barrier(2)
+        release_persist = threading.Event()
+        snapshot_started = threading.Event()
+        snapshot_finished = threading.Event()
+        snapshots = []
+        failures = []
+
+        def blocking_save(cookie):
+            try:
+                self.assertEqual(cookie, new_cookie)
+                self.assertEqual(
+                    main._active_client_state,
+                    main.ActiveClientState(old_client, old_cookie),
+                )
+                persist_barrier.wait(timeout=1)
+                release_persist.wait(timeout=1)
+            except BaseException as exc:
+                failures.append(exc)
+                release_persist.set()
+
+        def swap():
+            try:
+                main._save_and_swap_client(new_cookie, new_client)
+            except BaseException as exc:
+                failures.append(exc)
+
+        def snapshot():
+            try:
+                snapshot_started.set()
+                snapshots.append(main.get_client_snapshot())
+            except BaseException as exc:
+                failures.append(exc)
+            finally:
+                snapshot_finished.set()
+
+        with patch.object(main, "save_cookie", side_effect=blocking_save):
+            swap_thread = threading.Thread(target=swap)
+            swap_thread.start()
+            persist_barrier.wait(timeout=1)
+            snapshot_thread = threading.Thread(target=snapshot)
+            snapshot_thread.start()
+            self.assertTrue(snapshot_started.wait(timeout=1))
+            self.assertFalse(snapshot_finished.wait(timeout=0.1))
+            release_persist.set()
+            swap_thread.join(timeout=1)
+            snapshot_thread.join(timeout=1)
+
+        self.assertFalse(swap_thread.is_alive())
+        self.assertFalse(snapshot_thread.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(snapshots, [(new_client, new_cookie)])
+
+    def test_status_releases_lock_before_network_validation(self):
+        old_client = object()
+        new_client = object()
+        old_cookie = "a1=old; web_session=old"
+        new_cookie = "a1=new; web_session=new"
+        main._active_client_state = main.ActiveClientState(
+            old_client,
+            old_cookie,
+        )
+        validation_started = threading.Event()
+        release_validation = threading.Event()
+        swap_finished = threading.Event()
+        observed = []
+        failures = []
+
+        def blocking_validation(active_client, canonical_cookie):
+            observed.append((active_client, canonical_cookie))
+            validation_started.set()
+            release_validation.wait(timeout=1)
+            return main.CreatorSessionValidation(valid=True)
+
+        def status():
+            try:
+                main.session_status(main.API_KEY)
+            except BaseException as exc:
+                failures.append(exc)
+
+        def swap():
+            try:
+                main._save_and_swap_client(new_cookie, new_client)
+            except BaseException as exc:
+                failures.append(exc)
+            finally:
+                swap_finished.set()
+
+        with (
+            patch.object(
+                main,
+                "_validate_creator_session",
+                side_effect=blocking_validation,
+            ),
+            patch.object(main, "save_cookie"),
+        ):
+            status_thread = threading.Thread(target=status)
+            status_thread.start()
+            self.assertTrue(validation_started.wait(timeout=1))
+            swap_thread = threading.Thread(target=swap)
+            swap_thread.start()
+            self.assertTrue(swap_finished.wait(timeout=1))
+            release_validation.set()
+            status_thread.join(timeout=1)
+            swap_thread.join(timeout=1)
+
+        self.assertFalse(status_thread.is_alive())
+        self.assertFalse(swap_thread.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(observed, [(old_client, old_cookie)])
+        self.assertEqual(
+            main.get_client_snapshot(),
+            (new_client, new_cookie),
         )
 
     def test_saved_cookie_file_is_private_and_old_file_is_tightened(self):
