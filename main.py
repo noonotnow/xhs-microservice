@@ -23,12 +23,14 @@ import threading
 import traceback
 import unicodedata
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 import httpx
 import requests
 from xhs import XhsClient
+from xhs.exception import DataFetchError
 from xhs.help import sign as creator_sign
 from xhshow import Xhshow
 from sign_service import sign
@@ -129,6 +131,19 @@ COOKIE_HEADER_ERROR_MESSAGES = {
     "cookie_required_session_fields": (
         "Cookie request header is missing required non-empty session fields."
     ),
+}
+RECEIPT_SHARE_HOSTS = frozenset({
+    "www.rednote.com",
+    "www.xiaohongshu.com",
+})
+NOTE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+RECEIPT_ERROR_MESSAGES = {
+    "receipt_identifier_required": "Provide note_id or share_url.",
+    "receipt_identifier_invalid": "Receipt identifier is invalid.",
+    "receipt_identifier_mismatch": "note_id does not match share_url.",
+    "receipt_not_found": "Receipt could not be found or is not publicly available.",
+    "receipt_lookup_unavailable": "Receipt lookup is temporarily unavailable.",
+    "creator_session_invalid": "Creator session is invalid; re-login is required.",
 }
 
 
@@ -1117,6 +1132,238 @@ def session_status(x_api_key: str | None = Header(None)):
     )
 
 
+# --- Read-only Receipt Validation ---
+class ReceiptValidationRequest(BaseModel):
+    note_id: StrictStr | None = None
+    share_url: StrictStr | None = None
+
+
+def extract_note_id_from_share_url(share_url: str) -> str:
+    """Extract a note ID from one exact canonical RedNote/Xiaohongshu URL."""
+    if share_url != share_url.strip():
+        raise ValueError("invalid share URL")
+    parsed = urlparse(share_url)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("invalid share URL") from exc
+    hostname = (parsed.hostname or "").lower()
+    path_match = re.fullmatch(r"/explore/([A-Za-z0-9_-]{1,128})", parsed.path)
+    if (
+        parsed.scheme != "https"
+        or hostname not in RECEIPT_SHARE_HOSTS
+        or parsed.username
+        or parsed.password
+        or port is not None
+        or parsed.query
+        or parsed.fragment
+        or path_match is None
+    ):
+        raise ValueError("invalid share URL")
+    return path_match.group(1)
+
+
+def _normalize_note_id(note_id: str) -> str:
+    if note_id != note_id.strip() or not NOTE_ID_RE.fullmatch(note_id):
+        raise ValueError("invalid note ID")
+    return note_id
+
+
+def _resolve_receipt_note_id(req: ReceiptValidationRequest) -> str:
+    if req.note_id is None and req.share_url is None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "receipt_identifier_required",
+                "message": RECEIPT_ERROR_MESSAGES["receipt_identifier_required"],
+            },
+        )
+    try:
+        note_id = _normalize_note_id(req.note_id) if req.note_id is not None else None
+        url_note_id = (
+            extract_note_id_from_share_url(req.share_url)
+            if req.share_url is not None
+            else None
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "receipt_identifier_invalid",
+                "message": RECEIPT_ERROR_MESSAGES["receipt_identifier_invalid"],
+            },
+        ) from exc
+    if note_id is not None and url_note_id is not None and note_id != url_note_id:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "receipt_identifier_mismatch",
+                "message": RECEIPT_ERROR_MESSAGES["receipt_identifier_mismatch"],
+            },
+        )
+    return note_id or url_note_id
+
+
+def _normalize_timestamp(value) -> str | None:
+    if isinstance(value, str) and value.isdigit():
+        value = int(value)
+    if type(value) not in (int, float) or value < 0:
+        return None
+    seconds = value / 1000 if value >= 10_000_000_000 else value
+    try:
+        normalized = datetime.fromtimestamp(seconds, timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+    return normalized.isoformat().replace("+00:00", "Z")
+
+
+def _normalize_count(value) -> int | None:
+    if type(value) in (int, float):
+        try:
+            normalized = int(value)
+        except (OverflowError, ValueError):
+            return None
+        return normalized if normalized >= 0 else None
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(
+        r"(\d+(?:\.\d+)?)([kKwW万千]?)",
+        value.strip().replace(",", ""),
+    )
+    if match is None:
+        return None
+    multiplier = {
+        "": 1,
+        "k": 1_000,
+        "K": 1_000,
+        "千": 1_000,
+        "w": 10_000,
+        "W": 10_000,
+        "万": 10_000,
+    }[match.group(2)]
+    return int(float(match.group(1)) * multiplier)
+
+
+def normalize_receipt(note_id: str, note: dict) -> dict:
+    user = note.get("user") if isinstance(note.get("user"), dict) else {}
+    author_id = user.get("user_id") or user.get("id")
+    note_type = note.get("type")
+    return {
+        "note_id": note_id,
+        "share_url": f"https://www.xiaohongshu.com/explore/{note_id}",
+        "published_at": _normalize_timestamp(
+            note.get("time", note.get("publish_time"))
+        ),
+        "updated_at": _normalize_timestamp(
+            note.get("last_update_time", note.get("update_time"))
+        ),
+        "author_id": author_id if isinstance(author_id, str) else None,
+        "note_type": note_type if note_type in {"normal", "video"} else "unknown",
+    }
+
+
+def normalize_receipt_assets(note: dict) -> dict:
+    images = note.get("image_list")
+    note_type = note.get("type")
+    return {
+        "image_count": len(images) if isinstance(images, list) else 0,
+        "video_present": note_type == "video" or bool(note.get("video")),
+    }
+
+
+def normalize_receipt_metrics(note: dict, observed_at: str) -> dict:
+    interact_info = (
+        note.get("interact_info")
+        if isinstance(note.get("interact_info"), dict)
+        else {}
+    )
+    return {
+        "liked": _normalize_count(interact_info.get("liked_count")),
+        "collected": _normalize_count(interact_info.get("collected_count")),
+        "commented": _normalize_count(interact_info.get("comment_count")),
+        "shared": _normalize_count(interact_info.get("share_count")),
+        "observed_at": observed_at,
+    }
+
+
+def _safe_receipt_upstream_metadata(exc: Exception) -> tuple[int | None, int | None]:
+    response = getattr(exc, "response", None)
+    status = (
+        response.status_code
+        if response is not None and type(response.status_code) is int
+        else None
+    )
+    payload = exc.args[0] if exc.args and isinstance(exc.args[0], dict) else None
+    if payload is None and response is not None:
+        try:
+            response_payload = response.json()
+        except (AttributeError, ValueError, requests.RequestException):
+            response_payload = None
+        if isinstance(response_payload, dict):
+            payload = response_payload
+    code = None
+    if payload is not None:
+        code = _safe_upstream_number(payload.get("code"))
+        if code is None:
+            code = _safe_upstream_number(payload.get("result"))
+    return status, code
+
+
+def _receipt_lookup_error(exc: Exception) -> HTTPException:
+    status, code = _safe_receipt_upstream_metadata(exc)
+    if (
+        code == XHS_SESSION_EXPIRED_RESULT
+        or status in (401, 403)
+        or (status is not None and 300 <= status < 400)
+    ):
+        error_code = "creator_session_invalid"
+        response_status = 401
+    elif code == -510001 or status == 404 or isinstance(exc, IndexError):
+        error_code = "receipt_not_found"
+        response_status = 404
+    else:
+        error_code = "receipt_lookup_unavailable"
+        response_status = 502
+    logger.warning(
+        "Receipt lookup failed type=%s status=%s code=%s",
+        type(exc).__name__,
+        status,
+        code,
+    )
+    return HTTPException(
+        status_code=response_status,
+        detail={
+            "code": error_code,
+            "message": RECEIPT_ERROR_MESSAGES[error_code],
+        },
+    )
+
+
+@app.post("/receipt/validate")
+def validate_receipt(
+    req: ReceiptValidationRequest,
+    x_api_key: str | None = Header(None),
+):
+    require_api_key(x_api_key)
+    note_id = _resolve_receipt_note_id(req)
+    try:
+        note = get_client().get_note_by_id(note_id)
+    except Exception as exc:
+        raise _receipt_lookup_error(exc) from exc
+    if not isinstance(note, dict):
+        raise _receipt_lookup_error(TypeError("invalid receipt payload"))
+    upstream_note_id = note.get("note_id")
+    if not isinstance(upstream_note_id, str) or upstream_note_id != note_id:
+        raise _receipt_lookup_error(ValueError("receipt ID mismatch"))
+    observed_at = _normalize_timestamp(time.time())
+    return {
+        "status": "validated",
+        "receipt": normalize_receipt(note_id, note),
+        "assets": normalize_receipt_assets(note),
+        "metrics": normalize_receipt_metrics(note, observed_at),
+    }
+
+
 # --- File Upload ---
 @app.post("/upload")
 async def upload_image(
@@ -1134,12 +1381,15 @@ async def upload_image(
     return {"filepath": filepath, "filename": filename}
 
 
-# --- Publish / Schedule ---
+# --- Publish ---
 class PublishRequest(BaseModel):
     title: str
     desc: str
     files: list[str]  # Local file paths (from /upload endpoint)
-    post_time: str | None = None  # "YYYY-MM-DD HH:MM:SS" for scheduling
+    post_time: str | None = Field(
+        default=None,
+        description="Unsupported. Every non-null value is rejected.",
+    )
     topic_keywords: list[str] = []
     is_private: bool = False
 
@@ -1147,6 +1397,17 @@ class PublishRequest(BaseModel):
 @app.post("/publish")
 def publish_note(req: PublishRequest, x_api_key: str | None = Header(None)):
     require_api_key(x_api_key)
+    if req.post_time is not None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "scheduling_not_supported",
+                "message": (
+                    "Scheduled publishing is not supported; submit an immediate "
+                    "publish request without post_time."
+                ),
+            },
+        )
     try:
         xhs = get_client()
 
@@ -1227,9 +1488,9 @@ def publish_note(req: PublishRequest, x_api_key: str | None = Header(None)):
         if share_link:
             response["share_link"] = share_link
         return response
-    except Exception as e:
-        import traceback
-        return {"status": "error", "detail": str(e), "traceback": traceback.format_exc()}
+    except Exception as exc:
+        logger.error("Image publish failed: %s", type(exc).__name__)
+        return {"status": "error", "detail": "XHS image publish failed"}
 
 
 # --- Video Publish ---
@@ -1549,9 +1810,9 @@ def publish_video(req: VideoPublishRequest, x_api_key: str | None = Header(None)
                 "produce null cover URLs. Providing a cover_file is strongly recommended."
             )
         return response
-    except Exception as e:
-        import traceback
-        return {"status": "error", "detail": str(e), "traceback": traceback.format_exc()}
+    except Exception as exc:
+        logger.error("Video publish failed: %s", type(exc).__name__)
+        return {"status": "error", "detail": "XHS video publish failed"}
 
 
 @app.post("/publish-video-url")

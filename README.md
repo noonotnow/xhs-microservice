@@ -1,8 +1,10 @@
 # XHS Microservice
 
-FastAPI microservice for interacting with Xiaohongshu (小红书) via the [ReaJason/xhs](https://github.com/ReaJason/xhs) library.
+FastAPI execution microservice for interacting with Xiaohongshu (小红书) via the [ReaJason/xhs](https://github.com/ReaJason/xhs) library.
 
-Handles QR login, session persistence, image upload, and note publishing/scheduling to real Xiaohongshu.
+It performs an explicitly requested immediate publish or one normalized,
+read-only receipt lookup. It is not a worker, scheduler, lifecycle manager, or
+system of record.
 
 ## Architecture
 
@@ -24,9 +26,10 @@ Real Xiaohongshu API
 | POST | `/login/cookie` | Validate and save a Creator request cookie |
 | GET | `/session/status` | Check if current session is valid |
 | POST | `/upload` | Upload an image file (returns local path) |
-| POST | `/publish` | Publish or schedule a note |
+| POST | `/publish` | Immediately publish an image note |
 | POST | `/publish-video` | Publish a video already staged on this service |
 | POST | `/publish-video-url` | Stage and publish a trusted MEDIA video URL |
+| POST | `/receipt/validate` | Validate and normalize published-note evidence |
 
 All endpoints except `/health` require the permanent `X-Api-Key` header. For
 backward compatibility, `/upload` accepts that header or a short-lived
@@ -207,7 +210,12 @@ without exposing cookies, upload credentials, response bodies, or headers.
 ## Publishing Flow
 
 1. `POST /upload` with image file → returns `{filepath}`
-2. `POST /publish` with title, desc, files (from step 1), optional post_time
+2. `POST /publish` with title, desc, and files from step 1
+
+Publish routes execute immediately and only after an explicit request. The
+`post_time` field remains present for compatibility, but every non-null value
+is rejected with HTTP 422 and `scheduling_not_supported`; the service never
+silently converts a scheduled request into an immediate publish.
 
 ### Publishing a canonical MEDIA video
 
@@ -249,10 +257,76 @@ Validation failures use 4xx responses. MEDIA retrieval, XHS publishing, or a
 missing note ID use explicit 5xx responses. Calling this endpoint publishes
 immediately, so the caller must place it behind explicit operator confirmation.
 
-## Scheduling
+## Receipt validation
 
-Pass `post_time` in format `"YYYY-MM-DD HH:MM:SS"` to schedule a post.
-XHS handles the actual publishing at the scheduled time.
+`POST /receipt/validate` is the authenticated server-to-server evidence lookup.
+It requires the permanent `X-Api-Key` and accepts `note_id`, a canonical HTTPS
+share URL, or both:
+
+```http
+POST /receipt/validate
+X-Api-Key: <XHS_API_KEY>
+Content-Type: application/json
+
+{
+  "note_id": "64b000000000000001234567",
+  "share_url": "https://www.xiaohongshu.com/explore/64b000000000000001234567"
+}
+```
+
+Share URLs must use exactly `www.xiaohongshu.com` or `www.rednote.com` and the
+path `/explore/<id>`. The service never follows or fetches the caller-provided
+URL; it extracts the ID and performs one `XhsClient.get_note_by_id` lookup with
+the client's existing timeout. When both identifiers are supplied, they must
+match.
+
+The response contains only normalized receipt, asset, and observed metric
+fields:
+
+```json
+{
+  "status": "validated",
+  "receipt": {
+    "note_id": "64b000000000000001234567",
+    "share_url": "https://www.xiaohongshu.com/explore/64b000000000000001234567",
+    "published_at": "2023-07-22T04:26:40Z",
+    "updated_at": "2023-07-22T05:26:40Z",
+    "author_id": "author-id",
+    "note_type": "normal"
+  },
+  "assets": {
+    "image_count": 2,
+    "video_present": false
+  },
+  "metrics": {
+    "liked": 10,
+    "collected": 5,
+    "commented": 2,
+    "shared": 1,
+    "observed_at": "2026-08-06T22:32:22Z"
+  }
+}
+```
+
+Missing or private notes return `receipt_not_found`, transient lookup failures
+return `receipt_lookup_unavailable`, and an expired creator login returns
+`creator_session_invalid`. Raw upstream payloads and error text are never part
+of the API response.
+
+Receipt validation is side-effect-free. It does not stage or download media,
+run `ffprobe`, publish, persist cookies, write files, register MEDIA assets, or
+call any publish route. The strict container and codec checks on
+`/publish-video-url` remain publish-only.
+
+## Ownership boundary
+
+[xhs-platform](https://github.com/noonotnow/xhs-platform) owns sparse manifests,
+publication lifecycle, backfill and reconciliation, metrics persistence, and
+any optional automation (no more frequent than weekly). This service owns no
+manifest, queue, cadence clock, database state, Notion mutation, MEDIA
+registration, or reconciliation workflow. Receipt workflows call only
+`/receipt/validate`; they do not call publish routes and do not require MEDIA
+registration.
 
 ## Deployment (Railway)
 
