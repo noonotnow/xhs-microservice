@@ -22,6 +22,8 @@ import main
 
 MP4_BYTES = b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 32
 MEDIA_URL = "https://images.xhs.justlikekatie.com/videos/assets/post.mp4"
+NOTE_ID = "64b000000000000001234567"
+SHARE_URL = f"https://www.xiaohongshu.com/explore/{NOTE_ID}"
 
 
 class QRLoginRouteTests(unittest.TestCase):
@@ -2078,6 +2080,333 @@ class RemoteVideoEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.status_code, 415)
         self.assertFalse(os.path.exists(staged_path))
         publish.assert_not_called()
+
+
+class PublishSchedulingContractTests(unittest.TestCase):
+    def setUp(self):
+        self.client = TestClient(main.app)
+        self.headers = {"X-Api-Key": main.API_KEY}
+
+    def test_rejects_every_non_null_post_time_before_publish_work(self):
+        for post_time in ("2026-08-07 10:00:00", "", "not-a-time"):
+            with (
+                self.subTest(post_time=post_time),
+                patch.object(main, "get_client") as get_client,
+                patch.object(main.os.path, "exists") as path_exists,
+            ):
+                response = self.client.post(
+                    "/publish",
+                    headers=self.headers,
+                    json={
+                        "title": "Scheduled post",
+                        "desc": "Must not publish",
+                        "files": ["/tmp/image.jpg"],
+                        "post_time": post_time,
+                    },
+                )
+
+            self.assertEqual(response.status_code, 422)
+            self.assertEqual(
+                response.json()["detail"]["code"],
+                "scheduling_not_supported",
+            )
+            get_client.assert_not_called()
+            path_exists.assert_not_called()
+
+    def test_legacy_publish_failure_does_not_expose_raw_error_or_traceback(self):
+        canary = "synthetic-upstream-secret"
+        request = main.PublishRequest(
+            title="Immediate post",
+            desc="Publish now",
+            files=[],
+        )
+        with patch.object(main, "get_client", side_effect=RuntimeError(canary)):
+            result = main.publish_note(request, x_api_key=main.API_KEY)
+
+        self.assertEqual(
+            result,
+            {"status": "error", "detail": "XHS image publish failed"},
+        )
+        self.assertNotIn(canary, json.dumps(result))
+        self.assertNotIn("traceback", result)
+
+
+class ReceiptNormalizationTests(unittest.TestCase):
+    def test_extracts_only_exact_canonical_share_urls(self):
+        self.assertEqual(
+            main.extract_note_id_from_share_url(SHARE_URL),
+            NOTE_ID,
+        )
+        self.assertEqual(
+            main.extract_note_id_from_share_url(
+                f"https://www.rednote.com/explore/{NOTE_ID}"
+            ),
+            NOTE_ID,
+        )
+
+        invalid_urls = (
+            f"http://www.xiaohongshu.com/explore/{NOTE_ID}",
+            f"https://xiaohongshu.com/explore/{NOTE_ID}",
+            f"https://evil.www.xiaohongshu.com/explore/{NOTE_ID}",
+            f"https://www.xiaohongshu.com/explore/{NOTE_ID}/",
+            f"https://www.xiaohongshu.com/explore/{NOTE_ID}?xsec_token=secret",
+            f"https://www.xiaohongshu.com/explore/{NOTE_ID}#fragment",
+            f"https://www.xiaohongshu.com:443/explore/{NOTE_ID}",
+            f"https://user@www.xiaohongshu.com/explore/{NOTE_ID}",
+            f"https://www.xiaohongshu.com/discovery/{NOTE_ID}",
+            "https://xhslink.com/short-link",
+        )
+        for share_url in invalid_urls:
+            with self.subTest(share_url=share_url), self.assertRaises(ValueError):
+                main.extract_note_id_from_share_url(share_url)
+
+    def test_normalizers_return_fixed_sanitized_shapes(self):
+        note = {
+            "note_id": NOTE_ID,
+            "type": "video",
+            "time": 1_690_000_000_000,
+            "last_update_time": "1690003600000",
+            "user": {
+                "user_id": "author-123",
+                "nickname": "must-not-leak",
+            },
+            "image_list": [{"url": "secret-1"}, {"url": "secret-2"}],
+            "video": {"media": {"stream": "secret-video"}},
+            "interact_info": {
+                "liked_count": "1.2万",
+                "collected_count": "345",
+                "comment_count": 67,
+                "share_count": "8K",
+                "raw_secret": "must-not-leak",
+            },
+            "desc": "must-not-leak",
+        }
+
+        self.assertEqual(
+            main.normalize_receipt(NOTE_ID, note),
+            {
+                "note_id": NOTE_ID,
+                "share_url": SHARE_URL,
+                "published_at": "2023-07-22T04:26:40Z",
+                "updated_at": "2023-07-22T05:26:40Z",
+                "author_id": "author-123",
+                "note_type": "video",
+            },
+        )
+        self.assertEqual(
+            main.normalize_receipt_assets(note),
+            {"image_count": 2, "video_present": True},
+        )
+        self.assertEqual(
+            main.normalize_receipt_metrics(note, "2026-08-06T22:32:22Z"),
+            {
+                "liked": 12000,
+                "collected": 345,
+                "commented": 67,
+                "shared": 8000,
+                "observed_at": "2026-08-06T22:32:22Z",
+            },
+        )
+
+
+class ReceiptValidationEndpointTests(unittest.TestCase):
+    def setUp(self):
+        self.client = TestClient(main.app)
+        self.headers = {"X-Api-Key": main.API_KEY}
+        self.note = {
+            "note_id": NOTE_ID,
+            "type": "normal",
+            "time": 1_690_000_000_000,
+            "last_update_time": 1_690_003_600_000,
+            "user": {"user_id": "author-123", "nickname": "private-name"},
+            "image_list": [{}, {}],
+            "interact_info": {
+                "liked_count": "10",
+                "collected_count": "20",
+                "comment_count": "30",
+                "share_count": "40",
+            },
+            "title": "must-not-leak",
+            "desc": "must-not-leak",
+        }
+
+    def test_requires_permanent_api_key_before_lookup(self):
+        with patch.object(main, "get_client") as get_client:
+            response = self.client.post(
+                "/receipt/validate",
+                json={"note_id": NOTE_ID},
+            )
+
+        self.assertEqual(response.status_code, 403)
+        get_client.assert_not_called()
+
+    def test_requires_matching_valid_identifier_before_lookup(self):
+        cases = (
+            ({}, "receipt_identifier_required"),
+            (
+                {
+                    "note_id": NOTE_ID,
+                    "share_url": (
+                        "https://www.xiaohongshu.com/explore/"
+                        "64b000000000000001234568"
+                    ),
+                },
+                "receipt_identifier_mismatch",
+            ),
+            (
+                {"share_url": f"https://example.com/explore/{NOTE_ID}"},
+                "receipt_identifier_invalid",
+            ),
+        )
+        for payload, expected_code in cases:
+            with (
+                self.subTest(payload=payload),
+                patch.object(main, "get_client") as get_client,
+            ):
+                response = self.client.post(
+                    "/receipt/validate",
+                    headers=self.headers,
+                    json=payload,
+                )
+
+            self.assertEqual(response.status_code, 422)
+            self.assertEqual(response.json()["detail"]["code"], expected_code)
+            get_client.assert_not_called()
+
+    def test_returns_normalized_receipt_without_any_mutation_surface(self):
+        class ReadOnlyClient:
+            def __init__(self, note):
+                self.note = note
+                self.lookups = []
+
+            def get_note_by_id(self, note_id):
+                self.lookups.append(note_id)
+                return self.note
+
+        read_only_client = ReadOnlyClient(self.note)
+        mutation_names = (
+            "_stage_remote_media_video",
+            "_get_video_metadata",
+            "_get_image_dimensions",
+            "_validate_media_video_url",
+            "publish_note",
+            "publish_video",
+            "publish_video_url",
+            "save_cookie",
+            "_save_and_swap_client",
+        )
+        mutation_patches = [
+            patch.object(main, name)
+            for name in mutation_names
+        ]
+        mutation_mocks = [patcher.start() for patcher in mutation_patches]
+        self.addCleanup(
+            lambda: [patcher.stop() for patcher in reversed(mutation_patches)]
+        )
+        with (
+            patch.object(main, "get_client", return_value=read_only_client),
+            patch.object(main.time, "time", return_value=1_700_000_000),
+            patch.object(main.os, "makedirs") as makedirs,
+            patch("builtins.open") as open_file,
+            patch.object(Path, "write_text") as write_text,
+            patch.object(Path, "write_bytes") as write_bytes,
+            patch.object(Path, "unlink") as unlink,
+        ):
+            response = self.client.post(
+                "/receipt/validate",
+                headers=self.headers,
+                json={"share_url": SHARE_URL},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {
+                "status": "validated",
+                "receipt": {
+                    "note_id": NOTE_ID,
+                    "share_url": SHARE_URL,
+                    "published_at": "2023-07-22T04:26:40Z",
+                    "updated_at": "2023-07-22T05:26:40Z",
+                    "author_id": "author-123",
+                    "note_type": "normal",
+                },
+                "assets": {"image_count": 2, "video_present": False},
+                "metrics": {
+                    "liked": 10,
+                    "collected": 20,
+                    "commented": 30,
+                    "shared": 40,
+                    "observed_at": "2023-11-14T22:13:20Z",
+                },
+            },
+        )
+        self.assertEqual(read_only_client.lookups, [NOTE_ID])
+        for mutation_mock in mutation_mocks:
+            mutation_mock.assert_not_called()
+        makedirs.assert_not_called()
+        open_file.assert_not_called()
+        write_text.assert_not_called()
+        write_bytes.assert_not_called()
+        unlink.assert_not_called()
+
+    def test_maps_upstream_failures_to_sanitized_stable_codes(self):
+        cases = (
+            (
+                main.DataFetchError(
+                    {"code": -510001, "msg": "private-secret"}
+                ),
+                404,
+                "receipt_not_found",
+            ),
+            (IndexError("missing-secret"), 404, "receipt_not_found"),
+            (
+                main.DataFetchError(
+                    {"code": -100, "msg": "session-secret"}
+                ),
+                401,
+                "creator_session_invalid",
+            ),
+            (
+                main.requests.RequestException(
+                    "redirect-secret",
+                    response=types.SimpleNamespace(status_code=302),
+                ),
+                401,
+                "creator_session_invalid",
+            ),
+            (
+                main.requests.ConnectionError("transport-secret"),
+                502,
+                "receipt_lookup_unavailable",
+            ),
+        )
+        for error, expected_status, expected_code in cases:
+            fake_client = types.SimpleNamespace(
+                get_note_by_id=lambda note_id, error=error: (_ for _ in ()).throw(
+                    error
+                )
+            )
+            with (
+                self.subTest(expected_code=expected_code),
+                patch.object(main, "get_client", return_value=fake_client),
+            ):
+                response = self.client.post(
+                    "/receipt/validate",
+                    headers=self.headers,
+                    json={"note_id": NOTE_ID},
+                )
+
+            self.assertEqual(response.status_code, expected_status)
+            self.assertEqual(response.json()["detail"]["code"], expected_code)
+            for canary in (
+                "private-secret",
+                "missing-secret",
+                "session-secret",
+                "redirect-secret",
+                "transport-secret",
+            ):
+                self.assertNotIn(canary, response.text)
 
 
 if __name__ == "__main__":
